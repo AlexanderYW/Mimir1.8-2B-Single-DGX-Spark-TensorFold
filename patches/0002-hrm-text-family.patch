@@ -1,0 +1,1024 @@
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index b2d8022c9f4c038209031b3c4d0ff4c1d4762e3e..08c5209a488dde7291ac47a29daf0b83bc311b71 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -64,6 +64,8 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     const api = qwen35.import_table.get("engine_api").?; // family()'s, so the server and qwen3_5 share one
+     const canon = canonModule(b, target, optimize);
+     const verbs = @import("tp.zig").verbsModule(b, target, optimize);
++    // the dense engine, made once: every dense recipe's family module imports this one
++    const dense = @import("cuda_dense.zig").module(b, target, optimize, cuda, core, lanes);
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+@@ -87,7 +89,8 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "spark25", .module = @import("spark25.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "lfm2_moe_cuda", .module = @import("lfm2_moe_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "dory", .module = @import("dory.zig").module(b, target, optimize, cuda, core, lanes) },
+-            .{ .name = "dots_mocr_cuda", .module = @import("dots_mocr_cuda.zig").module(b, target, optimize, cuda, core, lanes, @import("cuda_dense.zig").module(b, target, optimize, cuda, core, lanes)) },
++            .{ .name = "dots_mocr_cuda", .module = @import("dots_mocr_cuda.zig").module(b, target, optimize, cuda, core, lanes, dense) },
++            .{ .name = "hrm_text_cuda", .module = @import("hrm_text_cuda.zig").module(b, target, optimize, cuda, core, lanes, dense) },
+             .{ .name = "muse_spark", .module = @import("muse.zig").moduleOver(b, target, optimize, cuda, core, lanes, @import("tp.zig").moduleWith(b, target, optimize, cuda, verbs)) },
+         },
+     });
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 2af39b4855fc0e5c575863780f57a915bd36fcdb..6828f3a519af96a4ad81ceb6cf756bf140d08ea5 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -125,6 +125,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "lfm2", .flags = glue }, // ours: LFM2's short convolution, QK norm and rotary, gates and label rows
+     .{ .name = "lfm2_moe", .flags = glue }, // ours: LFM2.5-24B-A2B's router, Liquid's 3-tap conv and commit (liquid_conv.cuh)
+     .{ .name = "dots_mocr", .flags = glue }, // ours: dots.mocr's text q|k|v RoPE, vision 2-D rotary and patch bias
++    .{ .name = "hrm_text", .flags = glue }, // ours: HRM-Text's scaled embedding, stack states, gate|q|k|v RoPE, output gate
+     .{ .name = "vit", .flags = glue }, // ours: vision towers' LayerNorm, Linear epilogues, activations, unshuffle
+     .{ .name = "moss_image", .flags = glue }, // ours: MOSS-Image's modulated norm, q/k rotary, situ, gated add
+     .{ .name = "nemo_audio", .flags = glue }, // ours: Nemotron Transcribe's audio encoder glue and head-64 attention
+diff --git a/zig/build/cuda_small_hosts.zig b/zig/build/cuda_small_hosts.zig
+index c73fd287ceb45604899fa3df5fba6a68e1c22b44..43d4fc9144db534009492d4f014eed87e6060bab 100644
+--- a/zig/build/cuda_small_hosts.zig
++++ b/zig/build/cuda_small_hosts.zig
+@@ -1,4 +1,4 @@
+-//! Host test steps of the small CUDA families (Spark 2.5, LFM2 MoE, dots.mocr) and the dense engine.
++//! Host test steps of the small CUDA families (Spark 2.5, LFM2 MoE, dots.mocr, HRM-Text) and the dense engine.
+ const std = @import("std");
+ 
+ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, all: *std.Build.Step) void {
+@@ -7,4 +7,5 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
+     const dense = @import("cuda_dense.zig").module(b, host, .debug, cuda, core, lanes);
+     @import("cuda_dense.zig").host(b, dense, all);
+     @import("dots_mocr_cuda.zig").host(b, @import("dots_mocr_cuda.zig").module(b, host, .debug, cuda, core, lanes, dense), all);
++    @import("hrm_text_cuda.zig").host(b, @import("hrm_text_cuda.zig").module(b, host, .debug, cuda, core, lanes, dense), all);
+ }
+diff --git a/zig/build/hrm_text_cuda.zig b/zig/build/hrm_text_cuda.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4ddf25f0c9aa6d2c3823597c2e2342c87323262
+--- /dev/null
++++ b/zig/build/hrm_text_cuda.zig
+@@ -0,0 +1,12 @@
++//! HRM-Text's CUDA family (DFM-Mimir v1.8) over the runtime, the core, the lane core and the dense engine; its host tests.
++const std = @import("std");
++
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, dense: *std.Build.Module) *std.Build.Module {
++    return b.createModule(.{ .root_source_file = b.path("zig/src/families/hrm_text/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "lanes", .module = lanes }, .{ .name = "cuda_dense", .module = dense } } });
++}
++
++pub fn host(b: *std.Build, m: *std.Build.Module, all: *std.Build.Step) void {
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
++    b.step("test-hrm-text-cuda-host", "HRM-Text on CUDA: config, geometry, device bytes, Native decls and refusals without a GPU").dependOn(&run.step);
++    all.dependOn(&run.step);
++}
+diff --git a/zig/kernels/cuda/hrm_text.cu b/zig/kernels/cuda/hrm_text.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..c47e617c1e0e11438d1cbb5dff7ff45c648e51a7
+--- /dev/null
++++ b/zig/kernels/cuda/hrm_text.cu
+@@ -0,0 +1,94 @@
++// HRM-Text's CUDA glue (DFM-Mimir v1.8) beside the dense engine's launches, at Transformers' BF16 rounding points:
++// the scaled embedding rows, the recurrent states between stack calls, gate|q|k|v with RoPE, the output gate.
++
++#include <cuda_bf16.h>
++#include <math.h>
++#include <stdint.h>
++
++namespace tf_hrm {
++constexpr int HD = 128, HALF = HD / 2;
++
++__device__ __forceinline__ float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
++__device__ __forceinline__ float bfr(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
++}  // namespace tf_hrm
++
++using tf_hrm::bf;
++using tf_hrm::bfr;
++
++// Grid (rows, ceil(D / 256)), 256 threads: H [rows][D] = bf16(E[ids[row]] * scale), inputs_embeds * embedding_scale
++// (a bf16 tensor times a Python float: fp32 opmath, one rounding).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_hrm_embed(const int* __restrict__ IDS, const __nv_bfloat16* __restrict__ E, __nv_bfloat16* __restrict__ H, int D,
++                 float scale) {
++    const int64_t r = blockIdx.x;
++    const int c = blockIdx.y * 256 + threadIdx.x;
++    if (c >= D) return;
++    const int64_t id = IDS[r];
++    H[r * D + c] = __float2bfloat16_rn(__fmul_rn(bf(E[id * D + c]), scale));
++}
++
++// Grid (rows, ceil(D / 256)), 256 threads: the first stack call's input. ZH = H (z_H, the scaled embedding),
++// H = bf16(Z0[col] + H): z_L_init.expand_as(z_H) + z_H.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_hrm_start(__nv_bfloat16* __restrict__ H, __nv_bfloat16* __restrict__ ZH, const __nv_bfloat16* __restrict__ Z0, int D) {
++    const int64_t at = (int64_t)blockIdx.x * D + blockIdx.y * 256 + threadIdx.x;
++    const int c = blockIdx.y * 256 + threadIdx.x;
++    if (c >= D) return;
++    const __nv_bfloat16 h = H[at];
++    ZH[at] = h;
++    H[at] = __float2bfloat16_rn(__fadd_rn(bf(Z0[c]), bf(h)));
++}
++
++// Grid (rows, ceil(D / 256)), 256 threads: a stack call ended with its final norm in X. KEEP = X (the state it
++// updates), H = bf16(X + OTHER): the next call's input is always the new state plus the other one
++// (L after L: z_L + z_H; H after L: z_H + z_L; L after H: z_L + z_H), and a bf16 sum is the same either way round.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_hrm_turn(const __nv_bfloat16* __restrict__ X, __nv_bfloat16* __restrict__ KEEP, const __nv_bfloat16* __restrict__ OTHER,
++                __nv_bfloat16* __restrict__ H, int D) {
++    const int c = blockIdx.y * 256 + threadIdx.x;
++    if (c >= D) return;
++    const int64_t at = (int64_t)blockIdx.x * D + c;
++    const __nv_bfloat16 x = X[at];
++    KEEP[at] = x;
++    H[at] = __float2bfloat16_rn(__fadd_rn(bf(x), bf(OTHER[at])));
++}
++
++// Grid (rows, 4 NH), 64 threads: thread j takes dims j and j + 64 of head h of the fused projection's bf16 row
++// GQKV [rows][gate NH | q NH | k NH | v NH] x 128. The gate heads go to G [rows][NH x 128], q rotated to
++// Q [rows][NH x 128], k rotated and v to KV [rows][k NH | v NH] x 128 (tf_nemo_kv_write_segs' rows).
++// HF: cos and sin are fp32 cos/sin of the fp32 angle pos x inv_freq, cast to bf16; q * cos and
++// rotate_half(q) * sin each round to bf16, and so does their sum.
++extern "C" __global__ void __launch_bounds__(64)
++    tf_hrm_gqkv_rope(const __nv_bfloat16* __restrict__ GQKV, const float* __restrict__ INV, const int* __restrict__ POS,
++                     __nv_bfloat16* __restrict__ G, __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ KV, int NH) {
++    using tf_hrm::HALF;
++    using tf_hrm::HD;
++    const int r = blockIdx.x, part = blockIdx.y / NH, h = blockIdx.y % NH, j = threadIdx.x;
++    const __nv_bfloat16* in = GQKV + ((int64_t)r * 4 * NH + blockIdx.y) * HD;
++    __nv_bfloat16* out;
++    if (part == 0) out = G + ((int64_t)r * NH + h) * HD;
++    else if (part == 1) out = Q + ((int64_t)r * NH + h) * HD;
++    else out = KV + ((int64_t)r * 2 * NH + (part - 2) * NH + h) * HD;
++    if (part == 0 || part == 3) {  // gate and v: as projected
++        out[j] = in[j];
++        out[j + HALF] = in[j + HALF];
++        return;
++    }
++    const float a = bf(in[j]), b = bf(in[j + HALF]);
++    const float angle = __fmul_rn(static_cast<float>(POS[r]), INV[j]);
++    const float c = bfr(cosf(angle)), s = bfr(sinf(angle));
++    out[j] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(a, c)), bfr(__fmul_rn(-b, s))));
++    out[j + HALF] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(b, c)), bfr(__fmul_rn(a, s))));
++}
++
++// Grid (rows, ceil(D / 256)), 256 threads: Y = bf16(bf16(sigmoid(G)) * Y) in place, torch.sigmoid(gate) * attn
++// on bf16 tensors (each op in fp32, rounded once).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_hrm_gate(const __nv_bfloat16* __restrict__ G, __nv_bfloat16* __restrict__ Y, int D) {
++    const int c = blockIdx.y * 256 + threadIdx.x;
++    if (c >= D) return;
++    const int64_t at = (int64_t)blockIdx.x * D + c;
++    const float g = bf(G[at]);
++    const float sg = bfr(__frcp_rn(__fadd_rn(1.0f, expf(-g))));
++    Y[at] = __float2bfloat16_rn(__fmul_rn(sg, bf(Y[at])));
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index adc585058021a7e6b25464b509f740e3d58f3ea8..5a829976ceb74eb55c071ba226741df9b69c94c9 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -57,6 +57,7 @@ pub const prefill_attention: []const u8 = if (available) &Blob("fatbin_prefill_a
+ pub const lfm2: []const u8 = if (available) &Blob("fatbin_lfm2").bytes else &.{};
+ pub const lfm2_moe: []const u8 = if (available) &Blob("fatbin_lfm2_moe").bytes else &.{};
+ pub const dots_mocr: []const u8 = if (available) &Blob("fatbin_dots_mocr").bytes else &.{};
++pub const hrm_text: []const u8 = if (available) &Blob("fatbin_hrm_text").bytes else &.{};
+ pub const vit: []const u8 = if (available) &Blob("fatbin_vit").bytes else &.{};
+ pub const moss_image: []const u8 = if (available) &Blob("fatbin_moss_image").bytes else &.{};
+ pub const nemo_audio: []const u8 = if (available) &Blob("fatbin_nemo_audio").bytes else &.{};
+diff --git a/zig/src/families/hrm_text/config.zig b/zig/src/families/hrm_text/config.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..39e5205f9e62442d08cee81667fb6a3a75b6ed43
+--- /dev/null
++++ b/zig/src/families/hrm_text/config.zig
+@@ -0,0 +1,225 @@
++//! HRM-Text (model_type hrm_text, DFM-Mimir v1.8) admission: two 16-layer stacks run H x (L + 1) times, PrefixLM.
++//!
++//! Transformers' HrmTextModel: z_H = embed(ids) * embedding_scale, z_L = z_L_init. For each of H_cycles high
++//! cycles, L_cycles times z_L = L(z_L + z_H), then z_H = H(z_H + z_L). Each stack is `per_stack` Llama-shaped
++//! layers (weightless RMS norms, multi-head attention with a sigmoid output gate, SwiGLU) and a weightless final
++//! norm; logits are lm_head(z_H). Every stack call keeps its own keys and values: layer slot
++//! (call * per_stack + layer), call = h * (L_cycles + 1) + l, the cache layout HrmTextModel's comment gives.
++const std = @import("std");
++
++pub const head_dim = 128;
++/// Stack calls the forward makes at most (H_cycles * (L_cycles + 1)): the layer slots stay within 256.
++pub const max_calls = 16;
++pub const max_per_stack = 32;
++/// The longest window a PrefixLM prompt runs whole in: the engine's prompt chunk (cuda_recipe.zig's prompt_rows).
++pub const max_context = 8192;
++
++pub const Error = error{
++    BadHrmConfig,
++    UnsupportedHrmGeometry,
++    UnsupportedHrmRotary,
++    UnsupportedHrmPrecision,
++    HrmPastPromptRows,
++} || std.json.ParseError(std.json.Scanner);
++
++pub const Config = struct {
++    hidden: usize,
++    intermediate: usize,
++    /// Layers a stack (transformers' num_layers_per_stack; config.json's num_hidden_layers before post-init).
++    per_stack: usize,
++    h_cycles: usize,
++    l_cycles: usize,
++    heads: usize,
++    vocab: usize,
++    eps: f32,
++    theta: f64,
++    embed_scale: f32,
++    /// The window this checkpoint folder names (max_position_embeddings).
++    context: usize,
++    prefix_lm: bool,
++    /// The folder's ModelOpt NVFP4 export (hf_quant_config.json or quantization_config): the projections packed.
++    nvfp4: bool = false,
++
++    pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
++        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
++        defer gpa.free(path);
++        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
++        defer gpa.free(bytes);
++        return parse(gpa, bytes);
++    }
++
++    /// Stack calls a forward makes: L_cycles L calls then one H call, H_cycles times.
++    pub fn calls(c: Config) usize {
++        return c.h_cycles * (c.l_cycles + 1);
++    }
++
++    /// Layer applications a token takes, each with its own cache slot: transformers' rewritten num_hidden_layers.
++    pub fn slots(c: Config) usize {
++        return c.calls() * c.per_stack;
++    }
++
++    pub fn width(c: Config) usize {
++        return c.heads * head_dim;
++    }
++
++    /// Whether stack call `call` (0-based) runs the H module; the others run the L module.
++    pub fn isHigh(c: Config, call: usize) bool {
++        return call % (c.l_cycles + 1) == c.l_cycles;
++    }
++};
++
++fn object(v: std.json.Value) Error!std.json.ObjectMap {
++    return if (v == .object) v.object else error.BadHrmConfig;
++}
++
++fn number(v: std.json.Value) Error!f64 {
++    return switch (v) {
++        .integer => |i| @floatFromInt(i),
++        .float => |f| f,
++        else => error.BadHrmConfig,
++    };
++}
++
++fn isString(v: ?std.json.Value, expected: []const u8) bool {
++    const s = v orelse return false;
++    return s == .string and std.mem.eql(u8, s.string, expected);
++}
++
++/// `key` is the JSON boolean `want`, or absent when `absent_ok`.
++fn isBool(o: std.json.ObjectMap, key: []const u8, want: bool, absent_ok: bool) bool {
++    const v = o.get(key) orelse return absent_ok;
++    return v == .bool and v.bool == want;
++}
++
++/// A positive dimension.
++fn size(o: std.json.ObjectMap, key: []const u8) Error!usize {
++    const v = o.get(key) orelse return error.BadHrmConfig;
++    if (v != .integer) return error.BadHrmConfig;
++    return if (v.integer > 0) @intCast(v.integer) else error.UnsupportedHrmGeometry;
++}
++
++/// The rope base: rope_parameters' (transformers 5), else rope_theta; only the default rope is taken.
++fn rope(o: std.json.ObjectMap) Error!f64 {
++    if (o.get("rope_scaling")) |r| if (r != .null) return error.UnsupportedHrmRotary;
++    if (o.get("rope_parameters")) |p| if (p != .null) {
++        const params = try object(p);
++        if (params.get("rope_type")) |t| if (!isString(t, "default")) return error.UnsupportedHrmRotary;
++        if (params.get("rope_theta")) |t| return number(t);
++    };
++    return number(o.get("rope_theta") orelse return error.BadHrmConfig);
++}
++
++/// The embeddings' scale as transformers sets it: embedding_scale, else 1 / initializer_range.
++fn embedScale(o: std.json.ObjectMap) Error!f64 {
++    if (o.get("embedding_scale")) |s| if (s != .null) return number(s);
++    const range = try number(o.get("initializer_range") orelse return error.BadHrmConfig);
++    if (!(range > 0)) return error.BadHrmConfig;
++    return 1.0 / range;
++}
++
++/// A ModelOpt NVFP4 export (group 16, weights only): true; none: false; any other scheme refused.
++fn modeloptNvfp4(q: std.json.Value) Error!bool {
++    if (q == .null) return false;
++    const o = try object(q);
++    if (!isString(o.get("quant_method"), "modelopt")) return error.UnsupportedHrmPrecision;
++    if (!isString(o.get("quant_algo"), "NVFP4")) return error.UnsupportedHrmPrecision;
++    if (o.get("group_size")) |g| if (g != .integer or g.integer != 16) return error.UnsupportedHrmPrecision;
++    if (o.get("kv_cache_quant_algo")) |k| if (k != .null) return error.UnsupportedHrmPrecision;
++    return true;
++}
++
++pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
++    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
++    defer parsed.deinit();
++    const root = try object(parsed.value);
++    if (!isString(root.get("model_type"), "hrm_text")) return error.BadHrmConfig;
++    // the released layer: SiLU SwiGLU, no biases, an untied head
++    if (!isString(root.get("hidden_act"), "silu")) return error.UnsupportedHrmGeometry;
++    for ([_][]const u8{ "attention_bias", "mlp_bias", "tie_word_embeddings" }) |key|
++        if (!isBool(root, key, false, true)) return error.UnsupportedHrmGeometry;
++    for ([_][]const u8{ "torch_dtype", "dtype" }) |key| if (root.get(key)) |d| if (!isString(d, "bfloat16")) return error.UnsupportedHrmPrecision;
++    const heads = try size(root, "num_attention_heads");
++    // multi-head attention: HrmTextAttention projects k and v to num_attention_heads (num_key_value_heads unused)
++    if (root.get("num_key_value_heads")) |kv| if (kv != .integer or kv.integer != heads) return error.UnsupportedHrmGeometry;
++    // a config saved after transformers' post-init names both; a raw export names the per-stack count only
++    const per_stack = if (root.get("num_layers_per_stack")) |v| (if (v == .integer and v.integer > 0) @as(usize, @intCast(v.integer)) else return error.BadHrmConfig) else try size(root, "num_hidden_layers");
++    var c: Config = .{
++        .hidden = try size(root, "hidden_size"),
++        .intermediate = try size(root, "intermediate_size"),
++        .per_stack = per_stack,
++        .h_cycles = try size(root, "H_cycles"),
++        .l_cycles = try size(root, "L_cycles"),
++        .heads = heads,
++        .vocab = try size(root, "vocab_size"),
++        .eps = @floatCast(try number(root.get("rms_norm_eps") orelse return error.BadHrmConfig)),
++        .theta = try rope(root),
++        .embed_scale = @floatCast(try embedScale(root)),
++        .context = try size(root, "max_position_embeddings"),
++        .prefix_lm = isBool(root, "prefix_lm", true, false),
++    };
++    if (root.get("num_layers_per_stack") != null) {
++        // post-init's num_hidden_layers is the slot count; a disagreeing pair is not this layout
++        if ((try size(root, "num_hidden_layers")) != c.slots()) return error.BadHrmConfig;
++    }
++    if (try size(root, "head_dim") != head_dim) return error.UnsupportedHrmGeometry;
++    if (c.calls() > max_calls or c.per_stack > max_per_stack) return error.UnsupportedHrmGeometry;
++    // the lane matmul steps k by 64s, the row kernels a 64-value vector
++    if (c.hidden % 64 != 0 or c.intermediate % 64 != 0 or c.width() != c.hidden) return error.UnsupportedHrmGeometry;
++    if (!(c.eps > 0) or !(c.theta > 0) or !(c.embed_scale > 0)) return error.BadHrmConfig;
++    if (c.prefix_lm and c.context > max_context) return error.HrmPastPromptRows;
++    if (root.get("quantization_config")) |q| c.nvfp4 = try modeloptNvfp4(q);
++    return c;
++}
++
++const fixture = @embedFile("fixtures/config.json");
++
++test "DFM-Mimir-v1.8's config: two 16-layer stacks, 2 x (3 + 1) calls, 128 layer slots, PrefixLM" {
++    const c = try parse(std.testing.allocator, fixture);
++    try std.testing.expectEqual(@as(usize, 1536), c.hidden);
++    try std.testing.expectEqual(@as(usize, 4096), c.intermediate);
++    try std.testing.expectEqual(@as(usize, 16), c.per_stack);
++    try std.testing.expectEqual(@as(usize, 8), c.calls());
++    try std.testing.expectEqual(@as(usize, 128), c.slots());
++    try std.testing.expectEqual(@as(usize, 12), c.heads);
++    try std.testing.expectEqual(@as(usize, 262144), c.vocab);
++    try std.testing.expectEqual(@as(f64, 10000), c.theta);
++    try std.testing.expectEqual(@as(f32, @floatCast(39.191835884530846)), c.embed_scale);
++    try std.testing.expectEqual(@as(usize, 4096), c.context);
++    try std.testing.expect(c.prefix_lm and !c.nvfp4);
++    // calls 0, 1, 2 and 4, 5, 6 run L; 3 and 7 run H
++    for (0..8) |call| try std.testing.expectEqual(call == 3 or call == 7, c.isHigh(call));
++}
++
++test "hrm_text config: transformers' post-init layout, an 8K window and a ModelOpt NVFP4 export are admitted" {
++    const gpa = std.testing.allocator;
++    const post = try std.mem.replaceOwned(u8, gpa, fixture, "\"num_hidden_layers\": 16,", "\"num_hidden_layers\": 128, \"num_layers_per_stack\": 16,");
++    defer gpa.free(post);
++    try std.testing.expectEqual(@as(usize, 128), (try parse(gpa, post)).slots());
++    const window = try std.mem.replaceOwned(u8, gpa, fixture, "\"max_position_embeddings\": 4096", "\"max_position_embeddings\": 8192");
++    defer gpa.free(window);
++    try std.testing.expectEqual(@as(usize, 8192), (try parse(gpa, window)).context);
++    const q = try std.mem.replaceOwned(u8, gpa, fixture, "\"prefix_lm\": true,", "\"prefix_lm\": true, \"quantization_config\": {\"quant_method\": \"modelopt\", \"quant_algo\": \"NVFP4\", \"group_size\": 16, \"kv_cache_quant_algo\": null},");
++    defer gpa.free(q);
++    try std.testing.expect((try parse(gpa, q)).nvfp4);
++}
++
++test "hrm_text config: another geometry, rope, scheme or a window past the prompt chunk is refused" {
++    const gpa = std.testing.allocator;
++    const refused = .{
++        .{ "\"model_type\": \"hrm_text\"", "\"model_type\": \"llama\"", error.BadHrmConfig },
++        .{ "\"head_dim\": 128", "\"head_dim\": 64", error.UnsupportedHrmGeometry },
++        .{ "\"num_key_value_heads\": 12", "\"num_key_value_heads\": 4", error.UnsupportedHrmGeometry },
++        .{ "\"hidden_act\": \"silu\"", "\"hidden_act\": \"gelu\"", error.UnsupportedHrmGeometry },
++        .{ "\"tie_word_embeddings\": false", "\"tie_word_embeddings\": true", error.UnsupportedHrmGeometry },
++        .{ "\"rope_type\": \"default\"", "\"rope_type\": \"yarn\"", error.UnsupportedHrmRotary },
++        .{ "\"max_position_embeddings\": 4096", "\"max_position_embeddings\": 16384", error.HrmPastPromptRows },
++        .{ "\"H_cycles\": 2", "\"H_cycles\": 5", error.UnsupportedHrmGeometry },
++        .{ "\"prefix_lm\": true,", "\"prefix_lm\": true, \"quantization_config\": {\"quant_method\": \"modelopt\", \"quant_algo\": \"FP8\"},", error.UnsupportedHrmPrecision },
++    };
++    inline for (refused) |k| {
++        const bytes = try std.mem.replaceOwned(u8, gpa, fixture, k[0], k[1]);
++        defer gpa.free(bytes);
++        try std.testing.expect(!std.mem.eql(u8, bytes, fixture));
++        try std.testing.expectError(k[2], parse(gpa, bytes));
++    }
++}
+diff --git a/zig/src/families/hrm_text/cuda.zig b/zig/src/families/hrm_text/cuda.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e59b441dbe79577541a47e1edaf021bd22dd8ec
+--- /dev/null
++++ b/zig/src/families/hrm_text/cuda.zig
+@@ -0,0 +1,44 @@
++//! HRM-Text (DFM-Mimir v1.8) on CUDA: the hrm_text recipe behind the shared dense engine (native/cuda.zig's decls).
++const std = @import("std");
++const dense = @import("cuda_dense");
++
++pub const config = @import("config.zig");
++pub const recipe = @import("cuda_recipe.zig");
++pub const weights = @import("cuda_weights.zig");
++pub const kernels = @import("cuda_kernels.zig");
++pub const native = dense.Native(recipe);
++
++test {
++    _ = config;
++    _ = recipe;
++    _ = weights;
++    _ = kernels;
++}
++
++test "HRM-Text on CUDA: no reasoning block, no prompt states, an 8192-row prompt step, its refusals worded" {
++    try std.testing.expect(!native.reasoning and native.keeps_no_prompts);
++    try std.testing.expectEqual(@as(u32, 8192), native.prompt_rows);
++    try std.testing.expectEqualStrings("hrm_text", native.model_type);
++    // compiles the load and the layer
++    const hooks = .{ &native.open, &native.attach, &native.fits, &native.ledgerPool, &native.textWeightBytes };
++    inline for (hooks) |h| try std.testing.expect(@intFromPtr(h) != 0);
++    for ([_]anyerror{ error.BadHrmConfig, error.UnsupportedHrmGeometry, error.UnsupportedHrmRotary, error.UnsupportedHrmPrecision, error.HrmPastPromptRows, error.HrmShape, error.HrmTensorCount, error.PrefixPastPromptRows, error.UnsupportedDensePrefix }) |e|
++        try std.testing.expect(native.explain(null, e) != null);
++    try std.testing.expectStringStartsWith(native.explain(null, error.PrefixPastPromptRows).?, "HRM-Text is a PrefixLM");
++}
++
++test "HRM-Text on CUDA reads its geometry from the checkpoint's config and refuses another model's by name" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const fixture = @embedFile("fixtures/config.json");
++    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = fixture });
++    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    defer a.free(dir);
++    try std.testing.expectEqual(@as(usize, 128), (try recipe.geometry(a, io, dir)).layers);
++    const other = try std.mem.replaceOwned(u8, a, fixture, "\"hrm_text\"", "\"llama\"");
++    defer a.free(other);
++    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = other });
++    try std.testing.expectError(error.BadHrmConfig, recipe.geometry(a, io, dir));
++}
+diff --git a/zig/src/families/hrm_text/cuda_kernels.zig b/zig/src/families/hrm_text/cuda_kernels.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..c365d18d0e25e34785d94f400724d9b0bcb0c8a5
+--- /dev/null
++++ b/zig/src/families/hrm_text/cuda_kernels.zig
+@@ -0,0 +1,102 @@
++//! HRM-Text's own CUDA launches beside the dense engine's (hrm_text.cu): scaled embedding rows, the states between
++//! stack calls, gate|q|k|v with RoPE, and the attention output gate.
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// Threads a row kernel's block takes, one column each.
++const row_threads = 256;
++/// Threads a (row, head) RoPE block takes: dims j and j + 64 of a 128-dim head.
++const rope_threads = 64;
++
++fn int(x: usize) c_int {
++    return @intCast(x);
++}
++
++/// A row kernel's grid (rows, ceil(width / 256)), null when empty; past an int's range refused.
++fn rowGrid(rows: usize, width: usize) !?cuda.launch.Dim3 {
++    if (rows == 0 or width == 0) return null;
++    if (rows > std.math.maxInt(c_int) or width > std.math.maxInt(c_int)) return error.RowShape;
++    return .{ .x = @intCast(rows), .y = @intCast((width + row_threads - 1) / row_threads), .z = 1 };
++}
++
++pub const Kernels = struct {
++    mod: cuda.Module,
++    embed_fn: cuda.Function,
++    start_fn: cuda.Function,
++    turn_fn: cuda.Function,
++    rope_fn: cuda.Function,
++    gate_fn: cuda.Function,
++
++    pub fn load(ctx: *const cuda.Context) !Kernels {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var mod = try cuda.Module.load(ctx.d, cuda.kernels.hrm_text);
++        errdefer mod.unload();
++        return .{
++            .mod = mod,
++            .embed_fn = try mod.function("tf_hrm_embed"),
++            .start_fn = try mod.function("tf_hrm_start"),
++            .turn_fn = try mod.function("tf_hrm_turn"),
++            .rope_fn = try mod.function("tf_hrm_gqkv_rope"),
++            .gate_fn = try mod.function("tf_hrm_gate"),
++        };
++    }
++
++    pub fn deinit(k: *Kernels) void {
++        k.mod.unload();
++    }
++
++    /// h [rows, d] = bf16(table[ids[row]] * scale).
++    pub fn embed(k: *const Kernels, s: cuda.Stream, ids: u64, table: u64, h: u64, rows: usize, d: usize, scale: f32) !void {
++        const grid = try rowGrid(rows, d) orelse return;
++        var a: cuda.Args = .{};
++        for ([_]u64{ ids, table, h }) |v| a.add(v);
++        a.add(int(d));
++        a.add(scale);
++        try cuda.launch.launch(k.embed_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++    }
++
++    /// z_high = h; h = bf16(z_init + h): the first stack call's input.
++    pub fn start(k: *const Kernels, s: cuda.Stream, h: u64, z_high: u64, z_init: u64, rows: usize, d: usize) !void {
++        const grid = try rowGrid(rows, d) orelse return;
++        var a: cuda.Args = .{};
++        for ([_]u64{ h, z_high, z_init }) |v| a.add(v);
++        a.add(int(d));
++        try cuda.launch.launch(k.start_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++    }
++
++    /// keep = x (a stack call's final norm); h = bf16(x + other): the next call's input.
++    pub fn turn(k: *const Kernels, s: cuda.Stream, x: u64, keep: u64, other: u64, h: u64, rows: usize, d: usize) !void {
++        const grid = try rowGrid(rows, d) orelse return;
++        var a: cuda.Args = .{};
++        for ([_]u64{ x, keep, other, h }) |v| a.add(v);
++        a.add(int(d));
++        try cuda.launch.launch(k.turn_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++    }
++
++    /// From gqkv [rows, 4 heads x 128] bf16: gate heads to g, q rotated to q, k rotated and v to kv [rows, k | v].
++    pub fn gqkvRope(k: *const Kernels, s: cuda.Stream, gqkv: u64, inv: u64, pos: u64, g: u64, q: u64, kv: u64, rows: usize, heads: usize) !void {
++        if (rows == 0) return;
++        if (rows > std.math.maxInt(c_int) or 4 * heads > 65535) return error.RowShape;
++        var a: cuda.Args = .{};
++        for ([_]u64{ gqkv, inv, pos, g, q, kv }) |v| a.add(v);
++        a.add(int(heads));
++        try cuda.launch.launch(k.rope_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(4 * heads), .z = 1 }, .block = .{ .x = rope_threads } }, s, &a);
++    }
++
++    /// y = bf16(bf16(sigmoid(g)) * y) in place, both [rows, d].
++    pub fn gate(k: *const Kernels, s: cuda.Stream, g: u64, y: u64, rows: usize, d: usize) !void {
++        const grid = try rowGrid(rows, d) orelse return;
++        var a: cuda.Args = .{};
++        for ([_]u64{ g, y }) |v| a.add(v);
++        a.add(int(d));
++        try cuda.launch.launch(k.gate_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++    }
++};
++
++test "HRM-Text row grids: every row and column covered, empty calls launch nothing, oversize refused" {
++    try std.testing.expectEqual(@as(?cuda.launch.Dim3, null), try rowGrid(0, 1536));
++    const g = (try rowGrid(8192, 1536)).?;
++    try std.testing.expect(g.x == 8192 and g.y == 6 and g.z == 1);
++    try std.testing.expectEqual(@as(c_uint, 7), (try rowGrid(1, 1537)).?.y);
++    try std.testing.expectError(error.RowShape, rowGrid(@as(usize, std.math.maxInt(c_int)) + 1, 1));
++}
+diff --git a/zig/src/families/hrm_text/cuda_recipe.zig b/zig/src/families/hrm_text/cuda_recipe.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d6df05790fdbf2aee73c44ec17f4b581f94926f
+--- /dev/null
++++ b/zig/src/families/hrm_text/cuda_recipe.zig
+@@ -0,0 +1,152 @@
++//! HRM-Text as a cuda_dense recipe: the engine's layer i is stack call i / per_stack's layer i % per_stack, with its
++//! own cache slot i, so a token's 128 layer applications page like a 128-layer decoder's.
++//!
++//! Scratch use per layer (pass.zig's buffers): x.wide holds gate|q|k|v, then gate|up; x.acc's bytes hold the bf16
++//! attention gate across the attention; x.y the attention out, then the SwiGLU rows. The recurrent states z_L and
++//! z_H live in the weights' own row buffers.
++const std = @import("std");
++const cuda = @import("cuda");
++const dense = @import("cuda_dense");
++const cfg = @import("config.zig");
++const wts = @import("cuda_weights.zig");
++const kern = @import("cuda_kernels.zig");
++
++const Recipe = @This();
++const P = *const dense.Pass(Recipe);
++
++pub const name = "HRM-Text";
++pub const model_type = "hrm_text";
++pub const formats: []const []const u8 = &.{ "bf16", "modelopt-nvfp4" };
++/// The window the model card evaluates at (its vLLM run overrides max_position_embeddings to 8192, plain RoPE).
++pub const default_context: i64 = 8192;
++/// Thinking is off in the release's chat template: replies are content.
++pub const reasoning = false;
++/// A PrefixLM prompt runs whole: the engine's prompt chunk is the longest window served.
++pub const prompt_rows: u32 = cfg.max_context;
++
++pub const Weights = wts.Weights;
++pub const Kernels = kern.Kernels;
++
++/// The engine's geometry of an admitted HRM-Text config: a layer per stack call's layer, multi-head attention.
++pub fn geometryOf(c: cfg.Config) dense.Geometry {
++    const h: usize = c.hidden;
++    return .{
++        .hidden = h,
++        .layers = c.slots(),
++        .heads = c.heads,
++        .kv_heads = c.heads,
++        .head_dim = cfg.head_dim,
++        .vocab = c.vocab,
++        .eps = c.eps,
++        .context = c.context,
++        .acc = 4 * c.width(), // gate|q|k|v
++        .wide = 2 * c.intermediate, // gate|up
++        .mid = c.intermediate,
++        .theta = c.theta, // HF's float32 inv_freq at theta 1e4, head 128 matches rope.inverse bit for bit
++        .prefix_lm = c.prefix_lm,
++        .prompt_rows = prompt_rows,
++    };
++}
++
++/// config.json admitted as HRM-Text's, before any tensor is read.
++pub fn geometry(a: std.mem.Allocator, io: std.Io, dir: []const u8) !dense.Geometry {
++    return geometryOf(try cfg.Config.read(a, io, dir));
++}
++
++pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8) !Weights {
++    return wts.load(gpa, io, d, s, dir, prompt_rows);
++}
++
++/// The weights' and states' bytes on the device, every projection's format read from its header.
++pub fn weightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
++    return wts.bytesOf(a, io, dir, prompt_rows);
++}
++
++/// z_H's first value: the embedding rows times embedding_scale.
++pub fn embed(p: P) !void {
++    try p.own.embed(p.s, p.m.s.ids, p.w.embed, p.m.s.h, p.rows, p.g.hidden, p.w.config.embed_scale);
++}
++
++/// Layer application i. At a stack call's first layer the previous call ends (its last residual and its final
++/// norm, kept as the state it updates) and the call's input is formed: z_L_init + z_H for the first, else the new
++/// state plus the other one. Then one layer: weightless RMS, gate|q|k|v, RoPE, attention over slot i, sigmoid gate,
++/// o, weightless RMS, SwiGLU.
++pub fn layer(p: P, i: usize) !void {
++    const x = p.m.s;
++    const c = p.w.config;
++    const call = i / c.per_stack;
++    const j = i % c.per_stack;
++    const d = p.g.hidden;
++    if (j == 0) {
++        if (call == 0) {
++            try p.own.start(p.s, x.h, p.w.z_high, p.w.z_init, p.rows, d);
++        } else {
++            try p.norm(x.r, p.w.ones); // h + the last MLP's rows, then the stack's final norm into x
++            const high = c.isHigh(call - 1);
++            try p.own.turn(p.s, x.x, if (high) p.w.z_high else p.w.z_low, if (high) p.w.z_low else p.w.z_high, x.h, p.rows, d);
++        }
++        try p.norm(null, p.w.ones);
++    } else try p.norm(x.r, p.w.ones);
++    const l = p.w.layer(if (c.isHigh(call)) .high else .low, j);
++    try p.project(l.gqkv, x.x, x.wide);
++    try tapped(p, "gqkv", i, x.x, d, x.wide, p.g.acc);
++    try p.own.gqkvRope(p.s, x.wide, p.m.inv, x.pos, x.acc, x.q, x.kv, p.rows, c.heads);
++    try p.attend(i, x.q, x.kv, x.y);
++    try p.own.gate(p.s, x.acc, x.y, p.rows, c.width());
++    try p.project(l.o, x.y, x.r);
++    try tapped(p, "o", i, x.y, c.width(), x.r, d);
++    try p.norm(x.r, p.w.ones);
++    try p.project(l.gate_up, x.x, x.wide);
++    try p.siluMul(x.wide, x.y, p.g.mid);
++    try p.project(l.down, x.y, x.r);
++    try tapped(p, "down", i, x.y, p.g.mid, x.r, d);
++}
++
++/// A projection's input [rows, k] and output [rows, n] as `<class>.<layer>.x` and `.y`, when a check taps the pass.
++fn tapped(p: P, class: []const u8, i: usize, in: u64, k: usize, y: u64, n: usize) !void {
++    if (p.taps == null) return;
++    var stage: [32]u8 = undefined;
++    try p.tap(try std.fmt.bufPrint(&stage, "{s}.{d}.x", .{ class, i }), in, k);
++    try p.tap(try std.fmt.bufPrint(&stage, "{s}.{d}.y", .{ class, i }), y, n);
++}
++
++/// The last H call ends: its last residual and its final norm, z_H, the head's input rows.
++pub fn final(p: P) !void {
++    try p.norm(p.m.s.r, p.w.ones);
++}
++
++pub fn head(w: *const Weights) cuda.qmmf.Weight {
++    return w.head;
++}
++
++pub fn explain(err: anyerror) ?[]const u8 {
++    return switch (err) {
++        error.BadHrmConfig => "this checkpoint's config is not HRM-Text's (model_type hrm_text, HrmTextForCausalLM)",
++        error.UnsupportedHrmGeometry => "this HRM-Text checkpoint's geometry is not one the CUDA recipe serves: head dim 128, multi-head attention, SiLU SwiGLU without biases, an untied head, at most 16 stack calls of at most 32 layers",
++        error.UnsupportedHrmRotary => "this HRM-Text checkpoint's rope is not the default 1-D rope the recipe applies",
++        error.UnsupportedHrmPrecision => "this HRM-Text checkpoint is quantized another way: the recipe reads BF16 or a ModelOpt NVFP4 export (weights only, blocks of 16)",
++        error.HrmPastPromptRows => std.fmt.comptimePrint("this HRM-Text checkpoint names a window past {d} tokens: a PrefixLM prompt runs whole in one {d}-row chunk", .{ prompt_rows, prompt_rows }),
++        error.HrmShape, error.HrmTensorCount => "this HRM-Text checkpoint's tensors are not the release's (BF16) or its NVFP4 export's: download or export it again",
++        else => null,
++    };
++}
++
++test "Mimir v1.8's geometry: 128 layer slots of 12 heads x 128, PrefixLM prompts of up to 8192 rows" {
++    const c = try cfg.parse(std.testing.allocator, @embedFile("fixtures/config.json"));
++    const g = geometryOf(c);
++    try std.testing.expectEqual(dense.Geometry{ .hidden = 1536, .layers = 128, .heads = 12, .kv_heads = 12, .head_dim = 128, .vocab = 262144, .eps = 1e-6, .context = 4096, .acc = 6144, .wide = 8192, .mid = 4096, .theta = 1e4, .prefix_lm = true, .prompt_rows = 8192 }, g);
++    const shape = try dense.recipe.attentionShape(g);
++    try std.testing.expect(shape.hpc == 1 and shape.grid_y == 12 and shape.rows == 128);
++    try std.testing.expect(std.mem.indexOf(u8, shape.pattn, "pattn_prefix_kernel") != null);
++    // a token's keys and values over 128 slots: 768 KiB; a 512-row page 384 MiB
++    try std.testing.expectEqual(@as(u64, 128 * 2 * 512 * 1536 * 2), dense.pages.pageBytes(g));
++}
++
++test "HRM-Text rope: the engine's float32 inverse frequencies are Transformers' at theta 1e4, head dim 128" {
++    var mine: [64]f32 = undefined;
++    dense.rope.inverse(1e4, 128, &mine);
++    // torch: 1.0 / (10000.0 ** (torch.arange(0, 128, 2, dtype=torch.float) / 128)), bits as fixtures/rope_inv_freq.txt
++    const text = @embedFile("fixtures/rope_inv_freq.txt");
++    var it = std.mem.tokenizeAny(u8, text, ", \n");
++    for (mine) |v| try std.testing.expectEqual(try std.fmt.parseInt(u32, it.next().?, 0), @as(u32, @bitCast(v)));
++}
+diff --git a/zig/src/families/hrm_text/cuda_weights.zig b/zig/src/families/hrm_text/cuda_weights.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..57ee02b6ddc5b05fa1a457f8916ed7004bf91718
+--- /dev/null
++++ b/zig/src/families/hrm_text/cuda_weights.zig
+@@ -0,0 +1,206 @@
++//! HRM-Text on CUDA: the two stacks' projections as stored (BF16, or a ModelOpt NVFP4 export's), packed for the
++//! lane matmul; the bf16 embedding, z_L_init, the head; the recurrent states z_L and z_H a prompt chunk wide.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const cfg = @import("config.zig");
++
++const DeviceBuffer = cuda.DeviceBuffer;
++const Weight = cuda.qmmf.Weight;
++
++pub const Stack = enum { low, high };
++const stack_names = [_][]const u8{ "model.L_module", "model.H_module" };
++
++/// One stack layer as the checkpoint fuses it: gqkv is gate|q|k|v [4 width, hidden], gate_up is gate|up.
++pub const Layer = struct {
++    gqkv: Weight,
++    o: Weight,
++    gate_up: Weight,
++    down: Weight,
++};
++
++pub const Weights = struct {
++    gpa: std.mem.Allocator,
++    config: cfg.Config,
++    buffers: std.ArrayList(DeviceBuffer) = .empty,
++    /// [stack][layer]: the L module's layers, then the H module's.
++    layers: [2][]Layer = .{ &.{}, &.{} },
++    embed: u64 = 0, // bf16 [vocab, hidden]
++    z_init: u64 = 0, // bf16 [hidden]: z_L_init, every row's first low state
++    ones: u64 = 0, // bf16 [hidden] of 1.0: HrmTextRMSNorm has no weight, the engine's norm multiplies by these
++    head: Weight = undefined, // the untied lm_head
++    /// bf16 [rows, hidden] a prompt chunk's: the low and high states between stack calls.
++    z_low: u64 = 0,
++    z_high: u64 = 0,
++    /// Projections stored NVFP4 (counted at load, for the startup line).
++    packed4: usize = 0,
++
++    pub fn deinit(w: *Weights) void {
++        for (w.buffers.items) |*b| b.free();
++        w.buffers.deinit(w.gpa);
++        for (w.layers) |l| w.gpa.free(l);
++    }
++
++    fn alloc(w: *Weights, d: *const cuda.Driver, bytes: usize) !DeviceBuffer {
++        try w.buffers.ensureUnusedCapacity(w.gpa, 1);
++        const b = try DeviceBuffer.alloc(d, @max(bytes, 256));
++        w.buffers.appendAssumeCapacity(b);
++        return b;
++    }
++
++    pub fn layer(w: *const Weights, stack: Stack, i: usize) *const Layer {
++        return &w.layers[@backingInt(stack)][i];
++    }
++};
++
++/// A projection's shape: its rows (outputs) and inputs.
++const Shape = struct { n: usize, k: usize };
++
++fn shapes(c: cfg.Config) [4]Shape {
++    const h = c.hidden;
++    return .{ .{ .n = 4 * c.width(), .k = h }, .{ .n = h, .k = c.width() }, .{ .n = 2 * c.intermediate, .k = h }, .{ .n = h, .k = c.intermediate } };
++}
++const parts = [_][]const u8{ "attn.gqkv_proj", "attn.o_proj", "mlp.gate_up_proj", "mlp.down_proj" };
++
++/// A projection's device bytes: NVFP4 words and scale tiles over padded rows, or padded bf16 rows.
++fn projBytes(s: Shape, nvfp4: bool) u64 {
++    const npad = cuda.modelopt.padded(s.n);
++    return if (nvfp4) npad * s.k / 2 + npad * s.k / 16 else npad * s.k * 2;
++}
++
++/// The device bytes `load` allocates for `c`, with `prompt_rows` rows of states: what the host admits before it.
++pub fn deviceBytes(c: cfg.Config, prompt_rows: usize, head_nvfp4: bool) u64 {
++    var total: u64 = 0;
++    for (shapes(c)) |s| total += 2 * c.per_stack * projBytes(s, c.nvfp4);
++    total += c.vocab * c.hidden * 2; // the embedding, as stored
++    total += projBytes(.{ .n = c.vocab, .k = c.hidden }, head_nvfp4);
++    total += 2 * c.hidden * 2; // z_L_init and the ones
++    total += 2 * prompt_rows * c.hidden * 2; // z_L and z_H
++    return total;
++}
++
++/// Reads the checkpoint into the device on `s`, packing each projection for the lane.
++const Loader = struct {
++    w: *Weights,
++    ck: *core.Checkpoint,
++    d: *const cuda.Driver,
++    s: cuda.Stream,
++    pack: *const cuda.modelopt.Packer,
++    stage: DeviceBuffer,
++
++    /// A bf16 tensor as stored, in a buffer of its own.
++    fn raw(l: *Loader, name: []const u8, shape: []const usize) !u64 {
++        const t = try l.ck.expect(name, .bf16, shape);
++        const b = try l.w.alloc(l.d, t.bytes.len);
++        try b.upload(0, t.bytes);
++        return b.ptr;
++    }
++
++    /// `{base}.weight` packed for the lane: NVFP4 when stored as ModelOpt's codes (with weight_scale and
++    /// weight_scale_2), else bf16. A stored input_scale is left unread: the lane takes bf16 rows (W4A16).
++    fn proj(l: *Loader, base: []const u8, s: Shape) !Weight {
++        var buf: [3][160]u8 = undefined;
++        const wname = try std.fmt.bufPrint(&buf[0], "{s}.weight", .{base});
++        const t = try l.ck.get(wname);
++        if (t.dtype == .u8) {
++            if (s.k % 64 != 0) return error.HrmShape;
++            const codes = try l.ck.expect(wname, .u8, &.{ s.n, s.k / 2 });
++            const blocks = try l.ck.expect(try std.fmt.bufPrint(&buf[1], "{s}.weight_scale", .{base}), .f8_e4m3, &.{ s.n, s.k / 16 });
++            const g = try l.ck.get(try std.fmt.bufPrint(&buf[2], "{s}.weight_scale_2", .{base}));
++            if (g.dtype != .f32 or g.bytes.len != 4) return error.HrmShape;
++            const global: f32 = @bitCast(std.mem.readInt(u32, g.bytes[0..4], .little));
++            if (!(global > 0) or !std.math.isFinite(global)) return error.HrmShape;
++            const input = try std.fmt.bufPrint(&buf[1], "{s}.input_scale", .{base});
++            if (l.ck.has(input)) try l.ck.skip(input);
++            try l.stage.upload(0, codes.bytes);
++            try l.stage.upload(codes.bytes.len, blocks.bytes);
++            const npad = cuda.modelopt.padded(s.n);
++            const words = try l.w.alloc(l.d, npad * s.k / 2);
++            const tiles = try l.w.alloc(l.d, npad * s.k / 16);
++            try l.pack.fp4Lane(l.s, l.stage.ptr, l.stage.ptr + codes.bytes.len, words.ptr, tiles.ptr, s.n, s.k);
++            try l.s.synchronize(); // the next projection's upload reuses the stage
++            l.w.packed4 += 1;
++            return cuda.nvfp4.weight(words.ptr, tiles.ptr, global, s.n, s.k);
++        }
++        const b16 = try l.ck.expect(wname, .bf16, &.{ s.n, s.k });
++        try l.stage.upload(0, b16.bytes);
++        const b = try l.w.alloc(l.d, cuda.modelopt.padded(s.n) * s.k * 2);
++        try l.pack.bf16Lane(l.s, l.stage.ptr, b.ptr, s.n, s.k);
++        try l.s.synchronize();
++        return cuda.modelopt.bf16Weight(b.ptr, s.n, s.k);
++    }
++
++    /// A failed load's work proved complete (the packing stream, then the uploads' null stream) before buffers go.
++    fn settle(l: *const Loader) void {
++        cuda.completion.drain(l.d, l.s, "an HRM-Text weight load did not drain before its buffers were freed");
++        cuda.completion.drain(l.d, .{ .d = l.d, .handle = null }, "HRM-Text weight uploads did not drain before their buffers were freed");
++    }
++};
++
++/// The HRM-Text checkpoint at `dir`; `prompt_rows` rows of states. A tensor left over refuses.
++pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, prompt_rows: usize) !Weights {
++    const c = try cfg.Config.read(gpa, io, dir);
++    var ck = try core.Checkpoint.openModel(gpa, io, dir);
++    defer ck.close();
++    var pack = try cuda.modelopt.Packer.load(d);
++    defer pack.unload();
++    var w: Weights = .{ .gpa = gpa, .config = c };
++    errdefer w.deinit();
++    for (&w.layers) |*l| {
++        l.* = try gpa.alloc(Layer, c.per_stack);
++    }
++    const h: usize = c.hidden;
++    // the stage holds the largest tensor as stored: the bf16 head (or its codes and scales)
++    var stage = try DeviceBuffer.alloc(d, @as(usize, c.vocab) * h * 2);
++    defer stage.free();
++    var l: Loader = .{ .w = &w, .ck = &ck, .d = d, .s = s, .pack = &pack, .stage = stage };
++    errdefer l.settle(); // runs first on failure: the stage, the weights and the packer go after it
++    w.embed = try l.raw("model.embed_tokens.weight", &.{ c.vocab, h });
++    w.z_init = try l.raw("model.z_L_init", &.{h});
++    w.head = try l.proj("lm_head", .{ .n = c.vocab, .k = h });
++    const sh = shapes(c);
++    var name: [128]u8 = undefined;
++    for (stack_names, 0..) |stack, si| for (w.layers[si], 0..) |*y, i| {
++        var got: [4]Weight = undefined;
++        for (parts, sh, &got) |part, shape, *out|
++            out.* = try l.proj(try std.fmt.bufPrint(&name, "{s}.layers.{d}.{s}", .{ stack, i, part }), shape);
++        y.* = .{ .gqkv = got[0], .o = got[1], .gate_up = got[2], .down = got[3] };
++    };
++    if (ck.unused() != 0) return error.HrmTensorCount;
++    // the weightless norms' multiplier, and the states a prompt chunk wide
++    const ones = try gpa.alloc(u16, h);
++    defer gpa.free(ones);
++    @memset(ones, 0x3F80); // bf16 1.0
++    const ob = try w.alloc(d, h * 2);
++    try ob.upload(0, std.mem.sliceAsBytes(ones));
++    w.ones = ob.ptr;
++    w.z_low = (try w.alloc(d, prompt_rows * h * 2)).ptr;
++    w.z_high = (try w.alloc(d, prompt_rows * h * 2)).ptr;
++    try s.synchronize();
++    std.log.info("HRM-Text: {d} x {d} layers ({d} calls, {d} cache slots), {d} projections NVFP4, the rest bf16", .{ 2, c.per_stack, c.calls(), c.slots(), w.packed4 });
++    return w;
++}
++
++/// The checkpoint's device bytes, every header read for the head's and the layers' formats.
++pub fn bytesOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, prompt_rows: usize) !u64 {
++    var c = try cfg.Config.read(a, io, dir);
++    var ck = try core.Checkpoint.openModel(a, io, dir);
++    defer ck.close();
++    const head = try ck.get("lm_head.weight");
++    const layer = try ck.get("model.L_module.layers.0.attn.gqkv_proj.weight");
++    c.nvfp4 = layer.dtype == .u8;
++    return deviceBytes(c, prompt_rows, head.dtype == .u8);
++}
++
++test "HRM-Text device bytes: Mimir v1.8 in bf16 and as the NVFP4 export with a bf16 head" {
++    const c = try cfg.parse(std.testing.allocator, @embedFile("fixtures/config.json"));
++    // per layer bf16: (6144 + 1536 + 8192) x 1536 + 1536 x 4096 = 30.7M values; 32 layers
++    const layer_bf16: u64 = (6144 * 1536 + 1536 * 1536 + 8192 * 1536 + 1536 * 4096) * 2;
++    const table: u64 = 262144 * 1536 * 2;
++    const tail: u64 = 2 * 1536 * 2 + 2 * 8192 * 1536 * 2;
++    try std.testing.expectEqual(32 * layer_bf16 + 2 * table + tail, deviceBytes(c, 8192, false));
++    var q = c;
++    q.nvfp4 = true;
++    const layer4: u64 = (6144 * 1536 + 1536 * 1536 + 8192 * 1536 + 1536 * 4096) * 9 / 16; // codes + e4m3 a 16
++    try std.testing.expectEqual(32 * layer4 + 2 * table + tail, deviceBytes(q, 8192, false));
++}
+diff --git a/zig/src/families/hrm_text/fixtures/config.json b/zig/src/families/hrm_text/fixtures/config.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b21d872a6253be9be0ac85178aae285ff0af6e4
+--- /dev/null
++++ b/zig/src/families/hrm_text/fixtures/config.json
+@@ -0,0 +1,38 @@
++{
++  "model_type": "hrm_text",
++  "architectures": [
++    "HrmTextForCausalLM"
++  ],
++  "vocab_size": 262144,
++  "hidden_size": 1536,
++  "intermediate_size": 4096,
++  "num_hidden_layers": 16,
++  "num_attention_heads": 12,
++  "num_key_value_heads": 12,
++  "head_dim": 128,
++  "hidden_act": "silu",
++  "H_cycles": 2,
++  "L_cycles": 3,
++  "L_bp_cycles": [
++    3,
++    3
++  ],
++  "max_position_embeddings": 4096,
++  "rms_norm_eps": 1e-06,
++  "rope_theta": 10000.0,
++  "rope_parameters": {
++    "rope_type": "default",
++    "rope_theta": 10000.0
++  },
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "mlp_bias": false,
++  "use_cache": true,
++  "tie_word_embeddings": false,
++  "initializer_range": 0.025515518153991442,
++  "embedding_scale": 39.191835884530846,
++  "prefix_lm": true,
++  "pad_token_id": 0,
++  "bos_token_id": 2,
++  "eos_token_id": 106
++}
+\ No newline at end of file
+diff --git a/zig/src/families/hrm_text/fixtures/rope_inv_freq.txt b/zig/src/families/hrm_text/fixtures/rope_inv_freq.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5e9641ffe381d386c693883eaaa28054a1c3d98
+--- /dev/null
++++ b/zig/src/families/hrm_text/fixtures/rope_inv_freq.txt
+@@ -0,0 +1 @@
++0x3f800000, 0x3f5dafd7, 0x3f3ff911, 0x3f263de0, 0x3f0ff59a, 0x3ef953cf, 0x3ed7e89b, 0x3ebaf81b, 0x3ea1e89b, 0x3e8c3504, 0x3e72d423, 0x3e5247ed, 0x3e361887, 0x3e1db040, 0x3e088d77, 0x3dec7fd6, 0x3dcccccd, 0x3db15978, 0x3d99940d, 0x3d84fe4d, 0x3d6655c2, 0x3d47763f, 0x3d2cba15, 0x3d159348, 0x3d0186e3, 0x3ce054d2, 0x3cc2434f, 0x3ca8398b, 0x3c91ad39, 0x3c7c4d33, 0x3c5a7bf2, 0x3c3d3311, 0x3c23d70a, 0x3c0de12d, 0x3bf5b9b0, 0x3bd4ca15, 0x3bb8449c, 0x3b9f91cc, 0x3b8a2e77, 0x3b6f520e, 0x3b4f3e38, 0x3b33770f, 0x3b1b690d, 0x3b06946f, 0x3ae91528, 0x3ac9d75c, 0x3aaec98e, 0x3a975c0e, 0x3a83126f, 0x3a6301e2, 0x3a44948c, 0x3a2a3b44, 0x3a136a16, 0x39ff4fac, 0x39dd1725, 0x39bf74d7, 0x39a5cb60, 0x398f9272, 0x3978a815, 0x395753e4, 0x393a7753, 0x39217916, 0x390bd472, 0x38f22ce2
+diff --git a/zig/src/native/cuda_families.zig b/zig/src/native/cuda_families.zig
+index db2d88035e8d335964292e9b72dbe5d8c320f9cf..37584bddefe23ef56ae4bf9833cfc9fd826090d5 100644
+--- a/zig/src/native/cuda_families.zig
++++ b/zig/src/native/cuda_families.zig
+@@ -14,7 +14,7 @@ const dory = @import("dory");
+ const qwen3 = @import("qwen3_cuda");
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("muse_spark").native, @import("lfm2_moe_cuda").native };
++pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("dots_mocr_cuda").native, @import("hrm_text_cuda").native, @import("muse_spark").native, @import("lfm2_moe_cuda").native };
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len + 5]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats, .decision_formats = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{} };
+diff --git a/zig/src/native/cuda_family_info.zig b/zig/src/native/cuda_family_info.zig
+index c5f4796fb9968905e7626b8bf0a7e7d051e3702c..160f597472bd640ecd6f101fe0b06fb06d3bf78a 100644
+--- a/zig/src/native/cuda_family_info.zig
++++ b/zig/src/native/cuda_family_info.zig
+@@ -15,12 +15,12 @@ fn reasoning(comptime F: type) bool {
+     return if (@hasDecl(F, "reasoning")) F.reasoning else true;
+ }
+ 
+-test "a CUDA family declares replies without reasoning with `pub const reasoning = false`; only dots.mocr does" {
++test "a CUDA family declares replies without reasoning with `pub const reasoning = false`; only dots.mocr and HRM-Text do" {
+     try std.testing.expect(reasoning(struct {}));
+     try std.testing.expect(!reasoning(struct {
+         pub const reasoning = false;
+     }));
+-    inline for (registry) |F| try std.testing.expectEqual(!std.mem.eql(u8, F.model_type, "dots_ocr"), reasoning(F));
++    inline for (registry) |F| try std.testing.expectEqual(!std.mem.eql(u8, F.model_type, "dots_ocr") and !std.mem.eql(u8, F.model_type, "hrm_text"), reasoning(F));
+ }
+ 
+ test "the Info openWith serves carries each family's reasoning declaration over the host's" {

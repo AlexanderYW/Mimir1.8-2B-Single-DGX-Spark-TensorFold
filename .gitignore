@@ -1,0 +1,8 @@
+# per-machine files, never part of the repository
+work/
+.env
+.claude/
+__pycache__/
+*.log
+*.orig
+*.rej

@@ -1,0 +1,288 @@
+diff --git a/zig/kernels/cuda/prefill_attention.cu b/zig/kernels/cuda/prefill_attention.cu
+index d0be0a7b089b5d832807ab58c61a2da976a00ba1..38dc3b9702e4b0114532899a99a0a277579b36e3 100644
+--- a/zig/kernels/cuda/prefill_attention.cu
++++ b/zig/kernels/cuda/prefill_attention.cu
+@@ -20,6 +20,25 @@ pattn_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restric
+ #include "prefill_attention_rows.cuh"
+ }
+ 
++// pattn_kernel's paged body for a PrefixLM prompt: every row of the chunk over every key [0, p0 + W), no causal
++// mask (a chunk is the whole prompt from p0 = 0, so it is one bidirectional block; replies decode causally).
++template <int D, int WARPS, int HPC, int NS>
++__global__ void __launch_bounds__(32 * WARPS, 1)
++pattn_prefix_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc,
++                    const __nv_bfloat16* __restrict__ vc, __nv_bfloat16* __restrict__ out, int p0, int W, int H, int HK,
++                    int G, float scale, const int* __restrict__ PT, long long PS) {
++    constexpr bool causal = false;
++    constexpr int skip = 0;
++    constexpr bool P256 = false, HPAGED = false, F8 = false, HM = false;  // bf16 keys, row-major
++    constexpr bool IDS = false;  // no page ids in shared memory
++    constexpr int PN = 0;
++    constexpr int CAP = 0, PTOK = 1;
++    const float *ks = nullptr, *vs = nullptr;
++    const int HO = H;
++    auto first_row = [] { return blockIdx.x * 16 * (WARPS / HPC); };
++#include "prefill_attention_rows.cuh"
++}
++
+ // One segment's rows from row `first` on, keys from p0 on `skip` rows further on: the body for tree_kernel.
+ template <int D, int WARPS, int HPC, int NS>
+ __device__ __forceinline__ void
+@@ -322,6 +341,17 @@ template __global__ void tf_prefill_attention::pattn_kernel<64, 8, 4, 8>(const _
+ template __global__ void tf_prefill_attention::pattn_kernel<128, 8, 2, 8>(const __nv_bfloat16* __restrict__,
+     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int,
+     int, int, float, const int* __restrict__, long long);
++// Head dim 128, eight warps, one query head a warp, eight staging slots (dense multi-head decoders: HRM-Text).
++template __global__ void tf_prefill_attention::pattn_kernel<128, 8, 1, 8>(const __nv_bfloat16* __restrict__,
++    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int,
++    int, int, float, const int* __restrict__, long long);
++// The PrefixLM prompt at head dim 128: one query head a warp (multi-head), and two a block (2 or 6 heads a KV head).
++template __global__ void tf_prefill_attention::pattn_prefix_kernel<128, 8, 1, 8>(const __nv_bfloat16* __restrict__,
++    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int,
++    int, int, float, const int* __restrict__, long long);
++template __global__ void tf_prefill_attention::pattn_prefix_kernel<128, 8, 2, 8>(const __nv_bfloat16* __restrict__,
++    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int,
++    int, int, float, const int* __restrict__, long long);
+ // Head dim 64, eight warps, two query heads a block, eight staging slots (dense OCR decoders: 2 heads a KV head).
+ template __global__ void tf_prefill_attention::pattn_kernel<64, 8, 2, 8>(const __nv_bfloat16* __restrict__,
+     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int,
+diff --git a/zig/src/cuda_dense/backend.zig b/zig/src/cuda_dense/backend.zig
+index 8e4b6d76a095d505d0aa1629865a13bd4a848dbb..88da5e6a0034165b7cb4d11066948d25e4704bbc 100644
+--- a/zig/src/cuda_dense/backend.zig
++++ b/zig/src/cuda_dense/backend.zig
+@@ -16,7 +16,7 @@ const ring = draws_.ring;
+ const be = lanes.backend;
+ const Stream = lanes.Stream;
+ 
+-/// Prompt rows a step takes: the forward's chunk grid, from position 0.
++/// Prompt rows a step takes by default: the forward's chunk grid, from position 0 (Geometry.prompt_rows sets it).
+ pub const prompt_rows = mdl.prompt_rows;
+ /// Window rows a round takes over every stream.
+ pub const round_rows = mdl.round_rows;
+@@ -254,10 +254,13 @@ pub fn Dense(comptime R: type) type {
+                 s.keepInterruptedPrefill(@intCast(at));
+                 return error.Cancelled;
+             }
+-            var end = @min(p.len, (at / prompt_rows + 1) * prompt_rows);
+-            for (s.reuse.marks) |mk| if (mk > at and mk < end) {
++            const grid = x.m.g.prompt_rows;
++            var end = @min(p.len, (at / grid + 1) * grid);
++            // a PrefixLM prompt is one bidirectional block: never cut at a mark (no prompt cache keeps it anyway)
++            if (!x.m.g.prefix_lm) for (s.reuse.marks) |mk| if (mk > at and mk < end) {
+                 end = mk;
+             };
++            if (x.m.g.prefix_lm and end != p.len) return error.PrefixPastPromptRows;
+             const done = end == p.len;
+             try x.forward(&.{.{ .slot = l.slot, .p0 = at, .tokens = p[at..end], .images = l.held.intersect(at, end) }}, true, end - at - 1, @intFromBool(done));
+             if (done) try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(l.last, x.m.s.logits, x.m.g.vocab * 2, x.e.s.handle), "cuMemcpyDtoDAsync");
+diff --git a/zig/src/cuda_dense/model.zig b/zig/src/cuda_dense/model.zig
+index 06a293223cf75ca0b9c96caa2c551b220c5992c5..0ee03c6466eb4cd8f3e9b57f5b467599c8cb03fa 100644
+--- a/zig/src/cuda_dense/model.zig
++++ b/zig/src/cuda_dense/model.zig
+@@ -9,13 +9,18 @@ const rope = @import("rope.zig");
+ const DeviceBuffer = cuda.DeviceBuffer;
+ const Geometry = recipe.Geometry;
+ 
+-/// Rows a prompt chunk takes.
++/// Rows a prompt chunk takes by default; a recipe's geometry may raise it (Geometry.prompt_rows).
+ pub const prompt_rows = 1024;
+ /// Rows a round of windows takes over every stream.
+ pub const round_rows = 128;
+ /// Key chunks one decode attention launch walks in parallel at most.
+ const chunk_blocks = 64;
+ 
++/// Rows the scratch holds: a prompt chunk's (the geometry's), and at least a round's.
++pub fn scratchRows(g: Geometry) usize {
++    return @max(g.prompt_rows, round_rows);
++}
++
+ /// The forward's buffers, `R` rows of each (a prompt chunk's); a recipe reads and writes them through its Pass.
+ pub const Scratch = struct {
+     ids: u64, // int32 [R]: tokens
+@@ -112,7 +117,7 @@ pub const Model = struct {
+     fn sizes(g: Geometry, lane: *const cuda.qmmf.Lane) struct { acc: usize, part: usize } {
+         const shapes = [_][2]usize{ .{ g.acc, g.hidden }, .{ g.hidden, g.qWidth() }, .{ g.wide, g.hidden }, .{ g.hidden, g.mid }, .{ g.vocab, g.hidden } };
+         var part: usize = 0;
+-        for (shapes) |nk| for (1..prompt_rows + 1) |rows| {
++        for (shapes) |nk| for (1..scratchRows(g) + 1) |rows| {
+             part = @max(part, lane.partBytes(rows, cuda.modelopt.bf16Weight(0, nk[0], nk[1])));
+         };
+         return .{ .acc = @max(g.acc, g.wide, g.hidden), .part = part };
+@@ -143,7 +148,7 @@ pub const Model = struct {
+ 
+     fn build(m: *Model, s: cuda.Stream) !void {
+         const g = m.g;
+-        const r = prompt_rows;
++        const r = scratchRows(g);
+         const parts = round_rows * m.chunks() * g.heads;
+         m.s = .{
+             .ids = try m.alloc(r * 4),
+diff --git a/zig/src/cuda_dense/native.zig b/zig/src/cuda_dense/native.zig
+index b59d11184041539721c88cafc7ab3915e8fa7f20..8f807035e238ac07ed47ba46e8c6ac58267c0e60 100644
+--- a/zig/src/cuda_dense/native.zig
++++ b/zig/src/cuda_dense/native.zig
+@@ -9,7 +9,7 @@ const mdl = @import("model.zig");
+ const backend = @import("backend.zig");
+ 
+ /// The refusals the engine words itself, for every recipe; a recipe's own come from its `explain`.
+-pub const engine_errors = [_]anyerror{ error.PastContext, error.NoFreeSlot, error.NoDraftHead, error.DenseTextOnly, error.StructuresUnsupported, error.NonFiniteLogits, error.CapturedKernels, error.ParallelPastRound, error.NoStreamFits, error.UnsupportedDenseHeadDim, error.UnsupportedDenseGroup, error.DenseImageSpan, error.DenseServedWithoutVision, error.DenseTowerWidth };
++pub const engine_errors = [_]anyerror{ error.PastContext, error.NoFreeSlot, error.NoDraftHead, error.DenseTextOnly, error.StructuresUnsupported, error.NonFiniteLogits, error.CapturedKernels, error.ParallelPastRound, error.NoStreamFits, error.UnsupportedDenseHeadDim, error.UnsupportedDenseGroup, error.UnsupportedDensePrefix, error.PrefixPastPromptRows, error.DensePromptRows, error.DenseImageSpan, error.DenseServedWithoutVision, error.DenseTowerWidth };
+ 
+ /// The host decls for recipe `R`: text-only, or with its tower's vision decls (the host reads their presence).
+ pub fn Native(comptime R: type) type {
+@@ -134,7 +134,8 @@ pub fn Core(comptime R: type) type {
+         const formats: []const []const u8 = R.formats;
+         const default_context: i64 = R.default_context;
+         const max_segments: u32 = 1;
+-        const prompt_rows: u32 = backend.prompt_rows;
++        /// The recipe's prompt chunk (its geometry's prompt_rows, declared so the host plans its prefill step by it).
++        const prompt_rows: u32 = if (@hasDecl(R, "prompt_rows")) R.prompt_rows else backend.prompt_rows;
+         const window_rows: u32 = backend.max_window;
+         const drafter_refusal = std.fmt.comptimePrint("--drafter: {s} on CUDA loads no drafter; serve it without --drafter", .{R.name});
+         /// Whether replies open with a reasoning block (the recipe's word, else the host's default).
+@@ -151,6 +152,9 @@ pub fn Core(comptime R: type) type {
+             if (o.lanes_fixed and o.lanes > backend.round_rows) return error.ParallelPastRound;
+             const g = try R.geometry(gpa, io, dir);
+             _ = try recipe.attentionShape(g); // refused by name before the weights load
++            if (g.prompt_rows != prompt_rows) return error.DensePromptRows; // the recipe's decl and its geometry agree
++            // a PrefixLM prompt runs whole in one chunk: the served window fits it
++            if (g.prefix_lm and o.context > g.prompt_rows) return error.PrefixPastPromptRows;
+             const own = try gpa.create(Owned);
+             errdefer gpa.destroy(own);
+             own.gpa = gpa;
+@@ -261,7 +265,10 @@ pub fn Core(comptime R: type) type {
+                 error.ParallelPastRound => std.fmt.comptimePrint("--parallel: {s} on CUDA holds at most {d} streams (a round's rows): serve --parallel {d} or fewer, or auto", .{ name, backend.round_rows, backend.round_rows }),
+                 error.NoStreamFits => "the CUDA memory budget fits no " ++ name ++ " stream after the weights: lower --context, free device memory, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
+                 error.UnsupportedDenseHeadDim => "this " ++ name ++ " checkpoint's attention head dim is not 64 or 128, the two the CUDA dense engine's attention kernels take",
+-                error.UnsupportedDenseGroup => "this " ++ name ++ " checkpoint's query heads a KV head are not an even count of at most 16, the groups the CUDA dense engine's attention kernels take",
++                error.UnsupportedDenseGroup => "this " ++ name ++ " checkpoint's query heads a KV head are not one or an even count of at most 16, the groups the CUDA dense engine's attention kernels take",
++                error.UnsupportedDensePrefix => "this " ++ name ++ " checkpoint is a PrefixLM, and the CUDA dense engine builds bidirectional prompt attention for head dim 128 at one or two query heads a KV head only",
++                error.PrefixPastPromptRows => std.fmt.comptimePrint("{s} is a PrefixLM: a prompt runs whole in one {d}-row chunk, so --context may not pass {d} tokens", .{ name, prompt_rows, prompt_rows }),
++                error.DensePromptRows => name ++ "'s recipe declares other prompt rows than its geometry: a build error, not a checkpoint's",
+                 error.DenseImageSpan => "each image must fill its own run of image tokens in the prompt, in order and within the request's image token budget (--vision-image-tokens)",
+                 error.DenseServedWithoutVision => name ++ " on CUDA was served without --vision: serve it with --vision to send images",
+                 error.DenseTowerWidth => "this " ++ name ++ " checkpoint's image tower writes rows of another width than its decoder's hidden size",
+diff --git a/zig/src/cuda_dense/pass.zig b/zig/src/cuda_dense/pass.zig
+index fcf71cafde7f782e846173ef09e8527c49418993..102bf3ae729ab030679d3855a27532efe0c2c756 100644
+--- a/zig/src/cuda_dense/pass.zig
++++ b/zig/src/cuda_dense/pass.zig
+@@ -122,7 +122,9 @@ pub fn rowsOf(m: *const Model, chains: []const Chain, prompt: bool, head0: usize
+         for (ch.images) |im| if (im.rows == 0 or im.row >= ch.tokens.len or im.rows > ch.tokens.len - im.row) return error.BadChain;
+         rows += ch.tokens.len;
+     }
+-    if (rows > @as(usize, if (prompt) mdl.prompt_rows else mdl.round_rows) or (prompt and chains.len != 1)) return error.BadWindow;
++    if (rows > @as(usize, if (prompt) m.g.prompt_rows else mdl.round_rows) or (prompt and chains.len != 1)) return error.BadWindow;
++    // PrefixLM: a prompt is one bidirectional block, so it runs whole, from position 0, in one forward
++    if (prompt and m.g.prefix_lm and chains[0].p0 != 0) return error.BadWindow;
+     if (chains.len > mdl.round_rows or heads > mdl.round_rows or head0 + heads > rows) return error.BadWindow;
+     return rows;
+ }
+diff --git a/zig/src/cuda_dense/recipe.zig b/zig/src/cuda_dense/recipe.zig
+index 94a6cc928cfa844c85921b6c3a10751f64411af7..b6b9831120ad902edc7b01c730d08786bf39c7a4 100644
+--- a/zig/src/cuda_dense/recipe.zig
++++ b/zig/src/cuda_dense/recipe.zig
+@@ -18,6 +18,11 @@ pub const Geometry = struct {
+     mid: usize, // the MLP's inner width
+     theta: ?f64 = null, // 1-D RoPE base (rope.zig's inverse frequencies on the device); null: no rotary positions
+     inv_freq: ?[]const f32 = null, // the reference's own inverse frequencies, when its pow is not correctly rounded
++    /// PrefixLM: a prompt's rows attend to every prompt row (one bidirectional block), replies stay causal. The
++    /// prompt then runs as one chunk from position 0, so the served window may not pass `prompt_rows`.
++    prefix_lm: bool = false,
++    /// Rows a prompt chunk takes (model.zig's scratch rows); a PrefixLM recipe raises it to its whole window.
++    prompt_rows: usize = 1024,
+ 
+     pub fn qWidth(g: Geometry) usize {
+         return g.heads * g.head_dim;
+@@ -54,11 +59,19 @@ fn pattnSymbol(comptime d: usize, comptime hpc: usize) [:0]const u8 {
+     return std.fmt.comptimePrint("_ZN20tf_prefill_attention12pattn_kernelILi{d}ELi8ELi{d}ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix", .{ d, hpc });
+ }
+ 
+-/// The pattn instances prefill_attention.cu builds at eight warps and eight slots: head dim, query heads a block.
+-const Instance = struct { d: usize, hpc: usize, symbol: [:0]const u8 };
++/// pattn_prefix_kernel: pattn_kernel's paged body with every row over every key of the chunk (no causal mask).
++fn prefixSymbol(comptime d: usize, comptime hpc: usize) [:0]const u8 {
++    return std.fmt.comptimePrint("_ZN20tf_prefill_attention19pattn_prefix_kernelILi{d}ELi8ELi{d}ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix", .{ d, hpc });
++}
++
++/// The pattn instances prefill_attention.cu builds at eight warps and eight slots: head dim, query heads a block,
++/// the PrefixLM instance when built (null: none), and whether the instance takes only a group of exactly `hpc`.
++const Instance = struct { d: usize, hpc: usize, symbol: [:0]const u8, prefix: ?[:0]const u8 = null, exact: bool = false };
+ const instances = [_]Instance{
+     .{ .d = 128, .hpc = 8, .symbol = pattnSymbol(128, 8) },
+-    .{ .d = 128, .hpc = 2, .symbol = pattnSymbol(128, 2) },
++    .{ .d = 128, .hpc = 2, .symbol = pattnSymbol(128, 2), .prefix = prefixSymbol(128, 2) },
++    // multi-head attention (a KV head a query head): one head a warp, 128 rows a block
++    .{ .d = 128, .hpc = 1, .symbol = pattnSymbol(128, 1), .prefix = prefixSymbol(128, 1), .exact = true },
+     .{ .d = 64, .hpc = 4, .symbol = pattnSymbol(64, 4) },
+     .{ .d = 64, .hpc = 2, .symbol = pattnSymbol(64, 2) },
+ };
+@@ -69,21 +82,28 @@ fn pattnShared(d: usize) u32 {
+     return @intCast(8 * 32 * chunks * 16);
+ }
+ 
+-/// The launches for `g`: the largest built pattn instance whose heads a block divide the group; refusals by name.
+-pub fn attentionShape(g: Geometry) error{ UnsupportedDenseHeadDim, UnsupportedDenseGroup }!Shape {
++/// The launches for `g`: the largest built pattn instance whose heads a block divide the group (its PrefixLM
++/// instance for a PrefixLM geometry); refusals by name.
++pub fn attentionShape(g: Geometry) error{ UnsupportedDenseHeadDim, UnsupportedDenseGroup, UnsupportedDensePrefix }!Shape {
+     if (g.head_dim != 64 and g.head_dim != 128) return error.UnsupportedDenseHeadDim;
+     if (g.kv_heads == 0 or g.heads % g.kv_heads != 0 or g.group() > max_group) return error.UnsupportedDenseGroup;
+     const group_n = g.group();
+-    for (instances) |in| if (in.d == g.head_dim and group_n % in.hpc == 0) return .{
+-        .pattn = in.symbol,
+-        .chunk = if (g.head_dim == 128) "tf_nemo_attn_chunk_segs" else "tf_paged_attn_chunk_segs_64",
+-        .merge = if (g.head_dim == 128) "tf_nemo_attn_merge_segs" else "tf_paged_attn_merge_segs_64",
+-        .hpc = in.hpc,
+-        .rows = 16 * (8 / in.hpc),
+-        .grid_y = g.kv_heads * (group_n / in.hpc),
+-        .shared = pattnShared(g.head_dim),
+-    };
+-    return error.UnsupportedDenseGroup;
++    var grouped = false;
++    for (instances) |in| {
++        if (in.d != g.head_dim or group_n % in.hpc != 0 or (in.exact and group_n != in.hpc)) continue;
++        grouped = true;
++        const pattn = if (g.prefix_lm) in.prefix orelse continue else in.symbol;
++        return .{
++            .pattn = pattn,
++            .chunk = if (g.head_dim == 128) "tf_nemo_attn_chunk_segs" else "tf_paged_attn_chunk_segs_64",
++            .merge = if (g.head_dim == 128) "tf_nemo_attn_merge_segs" else "tf_paged_attn_merge_segs_64",
++            .hpc = in.hpc,
++            .rows = 16 * (8 / in.hpc),
++            .grid_y = g.kv_heads * (group_n / in.hpc),
++            .shared = pattnShared(g.head_dim),
++        };
++    }
++    return if (grouped) error.UnsupportedDensePrefix else error.UnsupportedDenseGroup;
+ }
+ 
+ fn need(comptime R: type, comptime name: []const u8) void {
+@@ -176,6 +196,28 @@ fn shapeOf(heads: usize, kv_heads: usize, head_dim: usize) !Shape {
+     return attentionShape(.{ .hidden = heads * head_dim, .layers = 1, .heads = heads, .kv_heads = kv_heads, .head_dim = head_dim, .vocab = 1, .eps = 1e-6, .context = 1, .acc = 1, .wide = 1, .mid = 1 });
+ }
+ 
++fn prefixShapeOf(heads: usize, kv_heads: usize, head_dim: usize) !Shape {
++    return attentionShape(.{ .hidden = heads * head_dim, .layers = 1, .heads = heads, .kv_heads = kv_heads, .head_dim = head_dim, .vocab = 1, .eps = 1e-6, .context = 1, .acc = 1, .wide = 1, .mid = 1, .prefix_lm = true });
++}
++
++test "attention shapes: multi-head 12/12 x 128 takes one head a warp, causal or PrefixLM" {
++    const mha = try shapeOf(12, 12, 128);
++    try std.testing.expect(mha.hpc == 1 and mha.rows == 128 and mha.grid_y == 12 and mha.shared == 65536);
++    try std.testing.expectEqualStrings("_ZN20tf_prefill_attention12pattn_kernelILi128ELi8ELi1ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix", mha.pattn);
++    const prefix = try prefixShapeOf(12, 12, 128);
++    try std.testing.expect(prefix.hpc == 1 and prefix.rows == 128 and prefix.grid_y == 12);
++    try std.testing.expectEqualStrings("_ZN20tf_prefill_attention19pattn_prefix_kernelILi128ELi8ELi1ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix", prefix.pattn);
++    try std.testing.expectEqualStrings("tf_nemo_attn_chunk_segs", prefix.chunk); // replies decode causally as before
++    // any even group at head 128 takes the two-heads-a-block PrefixLM instance; head 64 refuses by name rather than
++    // run causally
++    try std.testing.expectEqual(@as(usize, 2), (try prefixShapeOf(12, 2, 128)).hpc);
++    try std.testing.expectEqual(@as(usize, 2), (try prefixShapeOf(64, 8, 128)).hpc);
++    try std.testing.expectError(error.UnsupportedDensePrefix, prefixShapeOf(16, 8, 64));
++    try std.testing.expectError(error.UnsupportedDenseGroup, prefixShapeOf(8, 8, 64));
++    // one head a warp takes a group of exactly one: an odd group still refuses
++    try std.testing.expectError(error.UnsupportedDenseGroup, shapeOf(12, 4, 128));
++}
++
+ test "attention shapes: dots 12/2 x 128, 16/8 x 128, 16/8 x 64 and 32/8 x 64" {
+     const dots = try shapeOf(12, 2, 128);
+     try std.testing.expectEqual(@as(usize, 2), dots.hpc);
