@@ -39,18 +39,18 @@ WINDOW="${WINDOW:-8192}"
 EXPORT_DEVICE="${EXPORT_DEVICE:-cpu}"     # cpu | cuda: where the export's arithmetic runs (cpu leaves the GPU alone)
 QUANT_LABEL="$( [[ "$FORMAT" == nvfp4 ]] && echo "NVFP4 stacks (ModelOpt layout, RTN, W4A16), BF16 embedding and ${HEAD_FORMAT^^} head" || echo "BF16 as released")"
 
-# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.4 release) with patches/*.patch
+# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.7 release) with patches/*.patch
 # applied in order (git apply in the checkout's root), with Zig ZIG_VERSION. Text only.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-12ebd414de443485d281768036ac4835e5abe8fe}"   # v1.3.4
+TF_REF="${TF_REF:-b336654937bfbee9035af9459f77c8d6fc8aebf1}"   # v1.3.7
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 # libtfgrammar.so comes prebuilt from TensorFold's own release archive, checked against its SHA-256 (xgrammar's Apache-2.0
 # notices ship with it). The dense engine serves no structured output yet, so it is only there for the server's tool parser.
-TF_RELEASE_VERSION=1.3.4
-TF_RELEASE_AARCH64_SHA256=02566a5297dd67db9b0b834737fe73e192907454896ee7d097d3a0dfca303937
-TF_TAG="v1.3.4-${TF_REF:0:7}"
+TF_RELEASE_VERSION=1.3.7
+TF_RELEASE_AARCH64_SHA256=9487e83d63cc5c12cf86994dffa72960ecdb2b3060516ac4926603a141f39ce3
+TF_TAG="v1.3.7-${TF_REF:0:7}"
 IMAGE="${IMAGE:-tensorfold-mimir18:${TF_TAG}}"
 image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -81,6 +81,15 @@ TOP_P="${TOP_P:-1}"
 TOP_K="${TOP_K:-0}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-8}"
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
+# Spark (GB10, 48 SMs) performance switches (patch 0003 + TensorFold v1.3.7):
+#   TF_DENSE_PDL=1: Blackwell programmatic dependent launch on qmmf decode lanes (bit-exact)
+#   TF_DENSE_PROMPT_FP4=1: persistent 128x256 scale-folded NVFP4 prompt GEMM + fused gate/up SwiGLU when filling > half SMs (0 keeps exact qmmf lane)
+#   TF_DENSE_PROMPT_BF16=1: sm_12x 128x128 BF16 K32/K64 prompt tiles (bit-exact)
+#   TF_GRAPH_CACHE=1: CUDA graph capture/replay for dense decode rounds (bit-exact; 0 runs eager)
+#   (TF_QMMF_HALF_BN stays off: halving o_proj BN from 64 to 32 doubled activation reads and regressed 4-stream decode by ~3%.)
+export TF_DENSE_PDL="${TF_DENSE_PDL:-1}"
+export TF_DENSE_PROMPT_FP4="${TF_DENSE_PROMPT_FP4:-1}"
+export TF_DENSE_PROMPT_BF16="${TF_DENSE_PROMPT_BF16:-1}"
 
 # WEIGHTS_GIB: the weights' device bytes (cuda_weights.zig's deviceBytes): NVFP4 stacks 0.54 GiB, bf16 embedding 0.75 GiB,
 # bf16 head 0.75 GiB, the recurrent states and scratch rows of an 8192-row prompt about 0.9 GiB. Not yet measured on a Spark.

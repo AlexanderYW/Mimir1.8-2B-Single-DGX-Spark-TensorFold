@@ -1,0 +1,953 @@
+diff --git a/zig/kernels/cuda/hrm_text.cu b/zig/kernels/cuda/hrm_text.cu
+index c47e617..83ea8ba 100644
+--- a/zig/kernels/cuda/hrm_text.cu
++++ b/zig/kernels/cuda/hrm_text.cu
+@@ -1,15 +1,27 @@
+ // HRM-Text's CUDA glue (DFM-Mimir v1.8) beside the dense engine's launches, at Transformers' BF16 rounding points:
+-// the scaled embedding rows, the recurrent states between stack calls, gate|q|k|v with RoPE, the output gate.
++// scaled embedding rows, weightless RMS norms and fused stack-turn norms with PDL launch_dependents, vectorized SwiGLU,
++// fused gate|q|k|v RoPE + paged KV write, and MHA (G = 1, HD = 128) decode attention + fused output gate.
+ 
+ #include <cuda_bf16.h>
+ #include <math.h>
+ #include <stdint.h>
+ 
++#include "common/glue_math.cuh"
++#include "norms_tail.cuh"
++#include "paged_attn.cuh"
++
+ namespace tf_hrm {
+ constexpr int HD = 128, HALF = HD / 2;
++constexpr int KW = HD / 2 + 4;  // 68 words: 16-byte aligned rows, avoids shared-memory bank conflicts
+ 
+ __device__ __forceinline__ float bf(__nv_bfloat16 v) { return __bfloat162float(v); }
+ __device__ __forceinline__ float bfr(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
++
++__device__ __forceinline__ void grid_launch() {
++#if __CUDA_ARCH__ >= 900
++    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
++#endif
++}
+ }  // namespace tf_hrm
+ 
+ using tf_hrm::bf;
+@@ -27,68 +39,391 @@ extern "C" __global__ void __launch_bounds__(256)
+     H[r * D + c] = __float2bfloat16_rn(__fmul_rn(bf(E[id * D + c]), scale));
+ }
+ 
+-// Grid (rows, ceil(D / 256)), 256 threads: the first stack call's input. ZH = H (z_H, the scaled embedding),
+-// H = bf16(Z0[col] + H): z_L_init.expand_as(z_H) + z_H.
+-extern "C" __global__ void __launch_bounds__(256)
+-    tf_hrm_start(__nv_bfloat16* __restrict__ H, __nv_bfloat16* __restrict__ ZH, const __nv_bfloat16* __restrict__ Z0, int D) {
+-    const int64_t at = (int64_t)blockIdx.x * D + blockIdx.y * 256 + threadIdx.x;
+-    const int c = blockIdx.y * 256 + threadIdx.x;
+-    if (c >= D) return;
+-    const __nv_bfloat16 h = H[at];
+-    ZH[at] = h;
+-    H[at] = __float2bfloat16_rn(__fadd_rn(bf(Z0[c]), bf(h)));
++// Grid (rows), 256 threads: weightless RMS norm matching norms_tail.cuh's MLX path with w = 1.0 (bit-identical):
++// H = bf16(H + R) (when R != null), X = bf16(H * inv_rms), plus PDL grid_launch() for the following matmul.
++// width % 64 == 0, width <= 8192, 16-byte aligned.
++extern "C" __global__ void __launch_bounds__(tf_rms_tail::NT)
++    tf_hrm_add_rms(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R, __nv_bfloat16* __restrict__ X,
++                   int width, float eps) {
++    using tf_rms_tail::MOST;
++    using tf_rms_tail::NT;
++    using tf_rms_tail::pack8;
++    using tf_rms_tail::unpack8;
++    tf_hrm::grid_launch();
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
++    const int chunks = width / 8;
++    float v[MOST][8];
++    uint4 hp_in[MOST], rp_in[MOST];
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            hp_in[j] = reinterpret_cast<const uint4*>(H + at)[c];
++            if (R != nullptr) rp_in[j] = reinterpret_cast<const uint4*>(R + at)[c];
++        } else {
++            hp_in[j] = rp_in[j] = make_uint4(0u, 0u, 0u, 0u);
++        }
++    }
++    float part = 0.f;
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        unpack8(hp_in[j], v[j]);
++        if (R != nullptr && c < chunks) {
++            float rv[8];
++            unpack8(rp_in[j], rv);
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = __fadd_rn(rv[i], v[j][i]);
++            const uint4 hp = pack8(v[j]);
++            reinterpret_cast<uint4*>(H + at)[c] = hp;
++            unpack8(hp, v[j]);
++        }
++#pragma unroll
++        for (int i = 0; i < 8; ++i) part = __fmaf_rn(v[j][i], v[j][i], part);
++    }
++    const float inv = tf_rms_tail::inv_rms<true>(part, width, eps);
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            float o[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) o[i] = __fmul_rn(v[j][i], inv);
++            reinterpret_cast<uint4*>(X + at)[c] = pack8(o);
++        }
++    }
+ }
+ 
+-// Grid (rows, ceil(D / 256)), 256 threads: a stack call ended with its final norm in X. KEEP = X (the state it
+-// updates), H = bf16(X + OTHER): the next call's input is always the new state plus the other one
+-// (L after L: z_L + z_H; H after L: z_H + z_L; L after H: z_L + z_H), and a bf16 sum is the same either way round.
++// Grid (rows), 256 threads: fused first stack start + initial weightless RMS norm (bit-identical):
++// ZH = H; H = bf16(Z0 + H); X = bf16(H * inv_rms), with PDL grid_launch() for layer 0's gqkv_proj.
++extern "C" __global__ void __launch_bounds__(tf_rms_tail::NT)
++    tf_hrm_start_rms(__nv_bfloat16* __restrict__ H, __nv_bfloat16* __restrict__ ZH,
++                     const __nv_bfloat16* __restrict__ Z0, __nv_bfloat16* __restrict__ X, int width, float eps) {
++    using tf_rms_tail::MOST;
++    using tf_rms_tail::NT;
++    using tf_rms_tail::pack8;
++    using tf_rms_tail::unpack8;
++    tf_hrm::grid_launch();
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
++    const int chunks = width / 8;
++    float v[MOST][8];
++    uint4 hp_in[MOST], z0_in[MOST];
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            hp_in[j] = reinterpret_cast<const uint4*>(H + at)[c];
++            z0_in[j] = reinterpret_cast<const uint4*>(Z0)[c];
++        } else {
++            hp_in[j] = z0_in[j] = make_uint4(0u, 0u, 0u, 0u);
++        }
++    }
++    float part = 0.f;
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            reinterpret_cast<uint4*>(ZH + at)[c] = hp_in[j];
++            float hv[8], zv[8];
++            unpack8(hp_in[j], hv);
++            unpack8(z0_in[j], zv);
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = __fadd_rn(zv[i], hv[i]);
++            const uint4 hp = pack8(v[j]);
++            reinterpret_cast<uint4*>(H + at)[c] = hp;
++            unpack8(hp, v[j]);
++        } else {
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = 0.f;
++        }
++#pragma unroll
++        for (int i = 0; i < 8; ++i) part = __fmaf_rn(v[j][i], v[j][i], part);
++    }
++    const float inv = tf_rms_tail::inv_rms<true>(part, width, eps);
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            float o[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) o[i] = __fmul_rn(v[j][i], inv);
++            reinterpret_cast<uint4*>(X + at)[c] = pack8(o);
++        }
++    }
++}
++
++// Grid (rows), 256 threads: fused stack-call boundary (replaces norm(r) + turn + norm(null) in one kernel, bit-identical):
++// h1 = bf16(H + R); k = bf16(h1 * inv1); KEEP = k; H = bf16(k + OTHER); X = bf16(H * inv2), with PDL grid_launch().
++extern "C" __global__ void __launch_bounds__(tf_rms_tail::NT)
++    tf_hrm_turn_rms(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
++                    __nv_bfloat16* __restrict__ KEEP, const __nv_bfloat16* __restrict__ OTHER,
++                    __nv_bfloat16* __restrict__ X, int width, float eps) {
++    using tf_rms_tail::MOST;
++    using tf_rms_tail::NT;
++    using tf_rms_tail::pack8;
++    using tf_rms_tail::unpack8;
++    tf_hrm::grid_launch();
++    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
++    const int chunks = width / 8;
++    float v[MOST][8];
++    uint4 hp_in[MOST], rp_in[MOST], op_in[MOST];
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            hp_in[j] = reinterpret_cast<const uint4*>(H + at)[c];
++            rp_in[j] = reinterpret_cast<const uint4*>(R + at)[c];
++            op_in[j] = reinterpret_cast<const uint4*>(OTHER + at)[c];
++        } else {
++            hp_in[j] = rp_in[j] = op_in[j] = make_uint4(0u, 0u, 0u, 0u);
++        }
++    }
++    float part1 = 0.f;
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            float hv[8], rv[8];
++            unpack8(hp_in[j], hv);
++            unpack8(rp_in[j], rv);
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = __fadd_rn(rv[i], hv[i]);
++            const uint4 hp = pack8(v[j]);
++            unpack8(hp, v[j]);
++        } else {
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = 0.f;
++        }
++#pragma unroll
++        for (int i = 0; i < 8; ++i) part1 = __fmaf_rn(v[j][i], v[j][i], part1);
++    }
++    const float inv1 = tf_rms_tail::inv_rms<false>(part1, width, eps);
++    float part2 = 0.f;
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            float kv[8], ov[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) kv[i] = __fmul_rn(v[j][i], inv1);
++            const uint4 kp = pack8(kv);
++            reinterpret_cast<uint4*>(KEEP + at)[c] = kp;
++            unpack8(kp, kv);
++            unpack8(op_in[j], ov);
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = __fadd_rn(kv[i], ov[i]);
++            const uint4 h2p = pack8(v[j]);
++            reinterpret_cast<uint4*>(H + at)[c] = h2p;
++            unpack8(h2p, v[j]);
++        } else {
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[j][i] = 0.f;
++        }
++#pragma unroll
++        for (int i = 0; i < 8; ++i) part2 = __fmaf_rn(v[j][i], v[j][i], part2);
++    }
++    const float inv2 = tf_rms_tail::inv_rms<true>(part2, width, eps);
++#pragma unroll
++    for (int j = 0; j < MOST; ++j) {
++        const int c = threadIdx.x + j * NT;
++        if (c < chunks) {
++            float o[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) o[i] = __fmul_rn(v[j][i], inv2);
++            reinterpret_cast<uint4*>(X + at)[c] = pack8(o);
++        }
++    }
++}
++
++// Grid (rows, ceil(F / (256 * 8))), 256 threads: vectorized SwiGLU (bit-identical to tf_lfm2_silu_mul) + PDL grid_launch().
++// F % 8 == 0, 16-byte aligned.
+ extern "C" __global__ void __launch_bounds__(256)
+-    tf_hrm_turn(const __nv_bfloat16* __restrict__ X, __nv_bfloat16* __restrict__ KEEP, const __nv_bfloat16* __restrict__ OTHER,
+-                __nv_bfloat16* __restrict__ H, int D) {
++    tf_hrm_silu_mul(const __nv_bfloat16* __restrict__ G, __nv_bfloat16* __restrict__ O, int F) {
++    using tf_glue::rbf;
++    using tf_glue::tf_silu;
++    using tf_rms_tail::pack8;
++    using tf_rms_tail::unpack8;
++    tf_hrm::grid_launch();
+     const int c = blockIdx.y * 256 + threadIdx.x;
+-    if (c >= D) return;
+-    const int64_t at = (int64_t)blockIdx.x * D + c;
+-    const __nv_bfloat16 x = X[at];
+-    KEEP[at] = x;
+-    H[at] = __float2bfloat16_rn(__fadd_rn(bf(x), bf(OTHER[at])));
++    const int chunks = F / 8;
++    if (c >= chunks) return;
++    const int64_t t = blockIdx.x;
++    float gv[8], uv[8], ov[8];
++    unpack8(reinterpret_cast<const uint4*>(G + t * 2 * F)[c], gv);
++    unpack8(reinterpret_cast<const uint4*>(G + t * 2 * F + F)[c], uv);
++#pragma unroll
++    for (int i = 0; i < 8; ++i) ov[i] = __fmul_rn(rbf(tf_silu(gv[i])), uv[i]);
++    reinterpret_cast<uint4*>(O + t * F)[c] = pack8(ov);
+ }
+ 
+-// Grid (rows, 4 NH), 64 threads: thread j takes dims j and j + 64 of head h of the fused projection's bf16 row
+-// GQKV [rows][gate NH | q NH | k NH | v NH] x 128. The gate heads go to G [rows][NH x 128], q rotated to
+-// Q [rows][NH x 128], k rotated and v to KV [rows][k NH | v NH] x 128 (tf_nemo_kv_write_segs' rows).
+-// HF: cos and sin are fp32 cos/sin of the fp32 angle pos x inv_freq, cast to bf16; q * cos and
+-// rotate_half(q) * sin each round to bf16, and so does their sum.
++// Grid (group_rows, 3 * NH), 64 threads: from GQKV [rows][gate NH | q NH | k NH | v NH] x 128, rotates q into
++// Q [rows][NH x 128], rotates k and copies v directly into each segment's paged KC/VC (gate stays in place in GQKV).
++// Exact HF bf16 rounding order: cos/sin cast to bf16, q * cos and rotate_half(q) * sin each rounded to bf16, then summed.
+ extern "C" __global__ void __launch_bounds__(64)
+-    tf_hrm_gqkv_rope(const __nv_bfloat16* __restrict__ GQKV, const float* __restrict__ INV, const int* __restrict__ POS,
+-                     __nv_bfloat16* __restrict__ G, __nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ KV, int NH) {
++    tf_hrm_gqkv_rope_kv(const AttnSegs sg, const __nv_bfloat16* __restrict__ GQKV, const float* __restrict__ INV,
++                        const int* __restrict__ POS, __nv_bfloat16* __restrict__ Q, int row_off, int NH) {
+     using tf_hrm::HALF;
+     using tf_hrm::HD;
+-    const int r = blockIdx.x, part = blockIdx.y / NH, h = blockIdx.y % NH, j = threadIdx.x;
+-    const __nv_bfloat16* in = GQKV + ((int64_t)r * 4 * NH + blockIdx.y) * HD;
+-    __nv_bfloat16* out;
+-    if (part == 0) out = G + ((int64_t)r * NH + h) * HD;
+-    else if (part == 1) out = Q + ((int64_t)r * NH + h) * HD;
+-    else out = KV + ((int64_t)r * 2 * NH + (part - 2) * NH + h) * HD;
+-    if (part == 0 || part == 3) {  // gate and v: as projected
+-        out[j] = in[j];
+-        out[j + HALF] = in[j + HALF];
++    const int rq = blockIdx.x, part = blockIdx.y / NH, h = blockIdx.y % NH, j = threadIdx.x;
++    const int row = row_off + rq;
++    const __nv_bfloat16* in = GQKV + ((int64_t)row * 4 * NH + (part + 1) * NH + h) * HD;
++    if (part == 0) {
++        const float a = bf(in[j]), b = bf(in[j + HALF]);
++        const float angle = __fmul_rn(static_cast<float>(POS[row]), INV[j]);
++        const float c = bfr(cosf(angle)), s = bfr(sinf(angle));
++        __nv_bfloat16* out = Q + ((int64_t)row * NH + h) * HD;
++        out[j] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(a, c)), bfr(__fmul_rn(-b, s))));
++        out[j + HALF] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(b, c)), bfr(__fmul_rn(a, s))));
++        return;
++    }
++    const int seg = seg_of(sg, rq);
++    const int64_t pos = static_cast<int64_t>(sg.META[seg][0]) + (rq - sg.ROW0[seg]);
++    const int kvd = NH * HD;
++    const int64_t at = key_at(sg.PT[seg], sg.PS, pos, kvd) + h * HD;
++    if (part == 2) {
++        sg.VC[seg][at + j] = in[j];
++        sg.VC[seg][at + j + HALF] = in[j + HALF];
+         return;
+     }
+     const float a = bf(in[j]), b = bf(in[j + HALF]);
+-    const float angle = __fmul_rn(static_cast<float>(POS[r]), INV[j]);
++    const float angle = __fmul_rn(static_cast<float>(POS[row]), INV[j]);
+     const float c = bfr(cosf(angle)), s = bfr(sinf(angle));
+-    out[j] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(a, c)), bfr(__fmul_rn(-b, s))));
+-    out[j + HALF] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(b, c)), bfr(__fmul_rn(a, s))));
++    sg.KC[seg][at + j] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(a, c)), bfr(__fmul_rn(-b, s))));
++    sg.KC[seg][at + j + HALF] = __float2bfloat16_rn(__fadd_rn(bfr(__fmul_rn(b, c)), bfr(__fmul_rn(a, s))));
+ }
+ 
+-// Grid (rows, ceil(D / 256)), 256 threads: Y = bf16(bf16(sigmoid(G)) * Y) in place, torch.sigmoid(gate) * attn
+-// on bf16 tensors (each op in fp32, rounded once).
++// Grid (rows, ceil(D / 256)), 256 threads: Y = bf16(bf16(sigmoid(GQKV[row, 0..D])) * Y) in place (prompt path).
+ extern "C" __global__ void __launch_bounds__(256)
+-    tf_hrm_gate(const __nv_bfloat16* __restrict__ G, __nv_bfloat16* __restrict__ Y, int D) {
++    tf_hrm_gate_strided(const __nv_bfloat16* __restrict__ GQKV, __nv_bfloat16* __restrict__ Y, int D) {
++    tf_hrm::grid_launch();
+     const int c = blockIdx.y * 256 + threadIdx.x;
+     if (c >= D) return;
+-    const int64_t at = (int64_t)blockIdx.x * D + c;
+-    const float g = bf(G[at]);
++    const int64_t r = blockIdx.x;
++    const float g = bf(GQKV[r * 4 * D + c]);
+     const float sg = bfr(__frcp_rn(__fadd_rn(1.0f, expf(-g))));
++    const int64_t at = r * D + c;
+     Y[at] = __float2bfloat16_rn(__fmul_rn(sg, bf(Y[at])));
+ }
++
++// MHA (G = 1, HD = 128) decode attention chunk kernel: bit-identical to tf_nemo_attn_chunk_segs at G = 1,
++// using 128 threads/block (no wasted GMAX=16 dummy heads), 16-byte coalesced K/V loads, and 1 thread/dim PV.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_hrm_attn_chunk_mha(const AttnSegs sg, const __nv_bfloat16* __restrict__ Q, float* __restrict__ PO,
++                          float* __restrict__ PM, float* __restrict__ PL, int H, int CH, int NCH, float scale) {
++    using tf_glue::tf_exp;
++    using tf_hrm::HD;
++    using tf_hrm::KW;
++    __shared__ __align__(16) float qs[HD];
++    __shared__ __align__(16) uint32_t kw[TILE][KW];
++    __shared__ __align__(16) uint32_t vw[TILE][HD / 2];
++    __shared__ float ps[TILE];
++    __shared__ float sm_alpha;
++
++    const int rq = blockIdx.x, k = seg_of(sg, rq), r = rq - sg.ROW0[k], head = blockIdx.y, t = threadIdx.x;
++    const __nv_bfloat16* __restrict__ KC = sg.KC[k];
++    const __nv_bfloat16* __restrict__ VC = sg.VC[k];
++    const int limit = sg.META[k][0] + r + 1;
++    if (static_cast<int>(blockIdx.z) * CH >= limit) return;
++
++    qs[t] = bf(Q[(static_cast<int64_t>(rq) * H + head) * HD + t]);
++    const int vw_col = t >> 1;
++    const bool vw_hi = (t & 1) != 0;
++    const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
++
++    for (int c = blockIdx.z; c * CH < limit; c += gridDim.z) {
++        float m = -INFINITY, den = 0.0f, o = 0.0f;
++        const int64_t cb = chunk_at(sg.PT[k], sg.PS, c, H * HD) - static_cast<int64_t>(c) * CH * H * HD;
++        for (int key0 = c * CH; key0 < (c + 1) * CH && key0 < limit; key0 += TILE) {
++            __syncthreads();
++#pragma unroll
++            for (int u = 0; u < 8; ++u) {
++                const int i = t + u * 128, j = i >> 4, w4 = i & 15;
++                const int64_t at = cb + (static_cast<int64_t>(key0 + j) * H + head) * HD;
++                const bool in = key0 + j < limit;
++                reinterpret_cast<uint4*>(&kw[j][0])[w4] = in ? reinterpret_cast<const uint4*>(KC + at)[w4] : zero4;
++                reinterpret_cast<uint4*>(&vw[j][0])[w4] = in ? reinterpret_cast<const uint4*>(VC + at)[w4] : zero4;
++            }
++            __syncthreads();
++            if (t < TILE) {
++                float acc = 0.0f;
++#pragma unroll 4
++                for (int w = 0; w < HD / 2; w += 2) {
++                    const uint2 kk = *reinterpret_cast<const uint2*>(&kw[t][w]);
++                    const float4 q = *reinterpret_cast<const float4*>(&qs[2 * w]);
++                    acc = __fmaf_rn(q.x, lo(kk.x), acc);
++                    acc = __fmaf_rn(q.y, hi(kk.x), acc);
++                    acc = __fmaf_rn(q.z, lo(kk.y), acc);
++                    acc = __fmaf_rn(q.w, hi(kk.y), acc);
++                }
++                ps[t] = key0 + t < limit ? __fmul_rn(acc, scale) : -INFINITY;
++            }
++            __syncthreads();
++            if (t < 32) {
++                const int jj = t & 15;
++                float sc[4];
++#pragma unroll
++                for (int u = 0; u < 4; ++u) sc[u] = ps[jj + 16 * u];
++                const float tile_m = half_max(fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3])));
++                const bool active = tile_m != -INFINITY;
++                const float next = active ? fmaxf(m, tile_m) : m;
++                const float alpha = active ? (m == -INFINITY ? 0.0f : tf_exp(__fsub_rn(m, next))) : 1.0f;
++                float local = 0.0f;
++#pragma unroll
++                for (int u = 0; u < 4; ++u) {
++                    const float p = active && key0 + jj + 16 * u < limit ? tf_exp(__fsub_rn(sc[u], next)) : 0.0f;
++                    if (t < 16) ps[jj + 16 * u] = p;
++                    local = __fadd_rn(local, p);
++                }
++                den = __fmaf_rn(den, alpha, half_sum(local));
++                m = next;
++                if (t == 0) sm_alpha = alpha;
++            }
++            __syncthreads();
++            const float alpha = sm_alpha;
++            float pv = 0.0f;
++#pragma unroll 4
++            for (int j = 0; j < TILE; ++j) {
++                const uint32_t word = vw[j][vw_col];
++                pv = __fmaf_rn(ps[j], vw_hi ? hi(word) : lo(word), pv);
++            }
++            o = __fmaf_rn(o, alpha, pv);
++        }
++        const int64_t base = (static_cast<int64_t>(rq) * NCH + c) * H + head;
++        PO[base * HD + t] = o;
++        if (t == 0) {
++            PM[base] = m;
++            PL[base] = den;
++        }
++    }
++}
++
++// MHA (G = 1, HD = 128) chunk merge fused with HRM-Text sigmoid output gate (reads gate directly from GQKV):
++// bit-identical to tf_nemo_attn_merge_segs + tf_hrm_gate, skipping unused XS sums and one full round-trip.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_hrm_attn_merge_gate(const AttnSegs sg, const float* __restrict__ PO, const float* __restrict__ PM,
++                           const float* __restrict__ PL, const __nv_bfloat16* __restrict__ GQKV,
++                           __nv_bfloat16* __restrict__ OUT, int row_off, int H, int CH, int NCH) {
++    using tf_glue::tf_exp;
++    using tf_hrm::HD;
++    tf_hrm::grid_launch();
++    const int rq = blockIdx.x, k = seg_of(sg, rq), r = rq - sg.ROW0[k], head = blockIdx.y, d = threadIdx.x;
++    const int limit = sg.META[k][0] + r + 1, nch = (limit + CH - 1) / CH;
++    float m = -INFINITY, den = 0.0f, o = 0.0f;
++    for (int c = 0; c < nch; ++c) {
++        const int64_t base = (static_cast<int64_t>(rq) * NCH + c) * H + head;
++        const float cm = PM[base], cl = PL[base];
++        const bool active = cl > 0.0f;
++        const float next = active ? fmaxf(m, cm) : m;
++        const float a = active ? (m == -INFINITY ? 0.0f : tf_exp(__fsub_rn(m, next))) : 1.0f;
++        const float b = active ? tf_exp(__fsub_rn(cm, next)) : 0.0f;
++        o = __fmaf_rn(o, a, __fmul_rn(PO[base * HD + d], b));
++        den = __fmaf_rn(den, a, __fmul_rn(cl, b));
++        m = next;
++    }
++    const float y_bf = bfr(__fdiv_rn(o, den));
++    const int64_t row = static_cast<int64_t>(row_off) + rq;
++    const int64_t D = static_cast<int64_t>(H) * HD;
++    const float g = bf(GQKV[row * 4 * D + head * HD + d]);
++    const float sg_val = bfr(__frcp_rn(__fadd_rn(1.0f, expf(-g))));
++    OUT[row * D + head * HD + d] = __float2bfloat16_rn(__fmul_rn(sg_val, y_bf));
++}
+diff --git a/zig/src/cuda_dense/backend.zig b/zig/src/cuda_dense/backend.zig
+index 88da5e6..6e59618 100644
+--- a/zig/src/cuda_dense/backend.zig
++++ b/zig/src/cuda_dense/backend.zig
+@@ -15,6 +15,19 @@ const Draws = draws_.Draws;
+ const ring = draws_.ring;
+ const be = lanes.backend;
+ const Stream = lanes.Stream;
++const gc = cuda.graph_cache;
++
++/// Concurrent streams covered by decode CUDA graph caching; wider rounds fall back to eager launches.
++const max_graph_chains = 16;
++
++/// Every kernel argument of a decode forward past staged ids/pos/meta follows the slots, chain lengths and logit slice.
++const GraphKey = struct {
++    n: u8,
++    head0: u16,
++    heads: u16,
++    slots: [max_graph_chains]u8,
++    lens: [max_graph_chains]u8,
++};
+ 
+ /// Prompt rows a step takes by default: the forward's chunk grid, from position 0 (Geometry.prompt_rows sets it).
+ pub const prompt_rows = mdl.prompt_rows;
+@@ -54,6 +67,8 @@ pub fn Dense(comptime R: type) type {
+         tower: Vision,
+         feats: std.ArrayList(cuda.DeviceBuffer) = .empty, // slot i's image rows (with a tower): the first at init
+         feat_bytes: usize, // one slot's: the request's image tokens at `hidden` bf16, 0 without a tower
++        graph_engine: gc.CudaEngine,
++        graphs: ?gc.Cache(GraphKey) = null,
+ 
+         /// The device bytes `init` allocates: the draws and a round's slots' last rows and rules.
+         pub fn openBytes(vocab: usize) usize {
+@@ -82,7 +97,7 @@ pub fn Dense(comptime R: type) type {
+                 b.* = try cuda.DeviceBuffer.alloc(d, if (i % 2 == 0) m.g.vocab * 2 else @sizeOf(cuda.sample.Rule));
+                 made += 1;
+             }
+-            var x: D = .{ .gpa = gpa, .d = d, .e = .{ .m = m, .k = k, .own = own, .w = w, .s = s }, .m = m, .free = free, .draws = draws, .slot_bufs = bufs, .tower = v, .feat_bytes = featureBytes(v, m.g.hidden) };
++            var x: D = .{ .gpa = gpa, .d = d, .e = .{ .m = m, .k = k, .own = own, .w = w, .s = s }, .m = m, .free = free, .draws = draws, .slot_bufs = bufs, .tower = v, .feat_bytes = featureBytes(v, m.g.hidden), .graph_engine = .{ .d = d } };
+             errdefer x.feats.deinit(gpa);
+             try x.addFeatures(1);
+             return x;
+@@ -105,6 +120,7 @@ pub fn Dense(comptime R: type) type {
+         }
+ 
+         pub fn deinit(x: *D) void {
++            if (x.graphs) |*g| g.deinit();
+             if (x.feats.items.len > 0) cuda.completion.drain(x.d, x.e.s, "the dense engine's image rows did not drain before they were freed");
+             x.dropFeatures(0);
+             x.feats.deinit(x.gpa);
+@@ -153,8 +169,39 @@ pub fn Dense(comptime R: type) type {
+             return @ptrCast(@alignCast(ptr));
+         }
+ 
++        const GraphBody = struct {
++            e: pass.Engine(R),
++            chains: []const pass.Chain,
++            rows: usize,
++            head0: usize,
++            heads: usize,
++
++            fn run(ctx: *anyopaque, s: cuda.Stream) anyerror!void {
++                const b: *GraphBody = @ptrCast(@alignCast(ctx));
++                var e = b.e;
++                e.s = s;
++                try pass.launch(R, e, b.chains, b.rows, false, b.head0, b.heads);
++            }
++        };
++
+         fn forward(x: *D, chains: []const pass.Chain, prompt: bool, head0: usize, heads: usize) !void {
+-            try pass.forward(R, x.e, chains, prompt, head0, heads);
++            if (prompt or x.e.taps != null or chains.len == 0 or chains.len > max_graph_chains) {
++                return pass.forward(R, x.e, chains, prompt, head0, heads);
++            }
++            const rows = try pass.rowsOf(x.m, chains, false, head0, heads);
++            try pass.upload(x.m, x.e.s, chains, rows);
++            if (x.graphs == null) {
++                x.graphs = gc.Cache(GraphKey).init(x.gpa, x.graph_engine.engine(), .{});
++                x.graphs.?.name = "dense rounds";
++            }
++            var key: GraphKey = .{ .n = @intCast(chains.len), .head0 = @intCast(head0), .heads = @intCast(heads), .slots = @splat(0), .lens = @splat(0) };
++            for (chains, 0..) |ch, i| {
++                key.slots[i] = @intCast(ch.slot);
++                key.lens[i] = @intCast(ch.tokens.len);
++            }
++            var body: GraphBody = .{ .e = x.e, .chains = chains, .rows = rows, .head0 = head0, .heads = heads };
++            const fp = gc.fingerprintOf(&.{ x.m.arena, x.m.table, x.m.s.h, x.m.s.logits });
++            _ = try x.graphs.?.run(key, x.e.s, fp, .{ .ctx = &body, .run = GraphBody.run });
+         }
+ 
+         fn freeSlot(x: *const D) ?usize {
+diff --git a/zig/src/cuda_dense/kernels.zig b/zig/src/cuda_dense/kernels.zig
+index 32365e5..57a45eb 100644
+--- a/zig/src/cuda_dense/kernels.zig
++++ b/zig/src/cuda_dense/kernels.zig
+@@ -21,11 +21,23 @@ fn int(x: usize) c_int {
+     return @intCast(x);
+ }
+ 
++/// Optional boolean environment switch (0/off disables, 1/on enables, unset keeps `default`).
++pub fn envFlag(name: [:0]const u8, default: bool) bool {
++    const raw = std.c.getenv(name) orelse return default;
++    const v = std.mem.span(raw);
++    if (v.len == 0) return default;
++    if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return false;
++    if (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "on")) return true;
++    return default;
++}
++
+ pub const Kernels = struct {
+     mods: [images.len]cuda.Module,
+     g: Geometry,
+     shape: recipe.Shape,
+     lane: cuda.qmmf.Lane,
++    prompt_gemm: cuda.nvfp4.Prompt,
++    prompt_fp4: bool,
+     norms: cuda.norms.Norms,
+     embed: cuda.embed_rows.EmbedRows,
+     vit: cuda.vit.Kernels,
+@@ -60,8 +72,14 @@ pub const Kernels = struct {
+         k.chunk = try m[3].function(shape.chunk);
+         k.merge = try m[3].function(shape.merge);
+         k.silu_mul = try m[4].function("tf_lfm2_silu_mul");
+-        k.lane = try cuda.qmmf.Lane.load(d, (try ctx.capability()) / 10);
++        const cap_major = (try ctx.capability()) / 10;
++        k.lane = try cuda.qmmf.Lane.load(d, cap_major);
+         errdefer k.lane.unload();
++        k.lane.pdl = envFlag("TF_DENSE_PDL", true) and cap_major >= 9;
++        if (envFlag("TF_DENSE_PROMPT_BF16", true)) try k.lane.loadPrompt(d);
++        k.prompt_gemm = try cuda.nvfp4.Prompt.load(d);
++        errdefer k.prompt_gemm.unload();
++        k.prompt_fp4 = envFlag("TF_DENSE_PROMPT_FP4", true);
+         k.norms = try cuda.norms.Norms.load(d);
+         errdefer k.norms.unload();
+         k.embed = try cuda.embed_rows.EmbedRows.load(d);
+@@ -74,6 +92,7 @@ pub const Kernels = struct {
+         k.vit.unload();
+         k.embed.unload();
+         k.norms.unload();
++        k.prompt_gemm.unload();
+         k.lane.unload();
+         for (&k.mods) |*m| m.unload();
+     }
+diff --git a/zig/src/cuda_dense/pass.zig b/zig/src/cuda_dense/pass.zig
+index 102bf3a..4bec038 100644
+--- a/zig/src/cuda_dense/pass.zig
++++ b/zig/src/cuda_dense/pass.zig
+@@ -47,11 +47,43 @@ pub fn Pass(comptime R: type) type {
+             return p.m.s.part;
+         }
+ 
+-        /// out [rows, n] bf16 = x [rows, k] times `w`, fp32 sums rounded once.
++        /// Whether an NVFP4 prompt call fills more than half the SMs on a 128 x `bn` tile (else qmmf's split-K lane wins).
++        fn takesPromptFp4(p: *const P, n: usize, bn: usize) bool {
++            if (!p.prompt or p.rows < 64 or !p.k.prompt_fp4) return false;
++            const tiles = ((p.rows + 127) / 128) * ((n + bn - 1) / bn);
++            return 2 * tiles > p.k.prompt_gemm.sms;
++        }
++
++        /// out [rows, n] bf16 = x [rows, k] times `w`, fp32 sums rounded once; large NVFP4 prompts take prompt_lean.
+         pub fn project(p: *const P, w: Weight, x: u64, out: u64) !void {
++            if (w.mode == .fp4 and p.takesPromptFp4(w.n, 256)) {
++                return p.k.prompt_gemm.matmul(p.s, x, w.k, p.rows, w, out);
++            }
+             try p.k.lane.matmul(p.s, x, w.k, p.rows, w, out, try p.part(w));
+         }
+ 
++        /// Fused NVFP4 prompt SwiGLU from a concatenated gate|up weight (`n = 2 * mid`, `mid % 128 == 0`); false: caller falls back.
++        pub fn projectSwiGlu(p: *const P, gate_up: Weight, x: u64, out: u64) !bool {
++            if (p.taps != null or gate_up.mode != .fp4 or gate_up.n % 256 != 0) return false;
++            const mid = gate_up.n / 2;
++            if (!p.takesPromptFp4(mid, 128)) return false;
++            const half_codes: u64 = @as(u64, mid) * gate_up.k / 2;
++            const half_scales: u64 = @as(u64, mid) * (gate_up.k / 16);
++            const gate_w: Weight = .{ .mode = .fp4, .codes = gate_up.codes, .scales = gate_up.scales, .scale = gate_up.scale, .n = mid, .k = gate_up.k, .npad = mid };
++            const up_w: Weight = .{ .mode = .fp4, .codes = gate_up.codes + half_codes, .scales = gate_up.scales + half_scales, .scale = gate_up.scale, .n = mid, .k = gate_up.k, .npad = mid };
++            try p.k.prompt_gemm.swiglu(p.s, x, gate_up.k, p.rows, gate_w, up_w, out, 0);
++            return true;
++        }
++
++        /// Prompt attention over already-populated layer `layer` pages (when the recipe fused KV writes into RoPE).
++        pub fn attendPromptOnly(p: *const P, layer: usize, q: u64, out: u64) !void {
++            if (layer >= p.g.layers) return error.BadLayer;
++            const m = p.m;
++            const kc = m.cache(layer, false);
++            const vc = m.cache(layer, true);
++            try p.k.prompt(p.s, q, kc, vc, out, p.chains[0].p0, p.rows, m.tableOf(p.chains[0].slot), m.pageElems());
++        }
++
+         /// out [rows, n] fp32 = x [rows, k] times `w`: the sums a recipe's own kernel rounds.
+         pub fn projectF32(p: *const P, w: Weight, x: u64, out: u64) !void {
+             try p.k.lane.matmulF32(p.s, x, w.k, p.rows, w, out, try p.part(w));
+@@ -138,11 +170,17 @@ pub fn splice(d: *const cuda.Driver, s: Stream, h: u64, hidden: usize, chains: [
+     }
+ }
+ 
+-/// Every chain's rows (a prompt chunk, or windows): the recipe's layers, then logits rows [head0, head0 + heads).
++/// Every chain's rows (a prompt chunk, or windows): stage ids/pos/meta, then launch the forward.
+ pub fn forward(comptime R: type, e: Engine(R), chains: []const Chain, prompt: bool, head0: usize, heads: usize) !void {
+     const m = e.m;
+     const rows = try rowsOf(m, chains, prompt, head0, heads);
+     try upload(m, e.s, chains, rows);
++    try launch(R, e, chains, rows, prompt, head0, heads);
++}
++
++/// Device launches of a staged forward (no host transfers or allocations: capturable in a CUDA graph).
++pub fn launch(comptime R: type, e: Engine(R), chains: []const Chain, rows: usize, prompt: bool, head0: usize, heads: usize) !void {
++    const m = e.m;
+     const p: Pass(R) = .{ .m = m, .k = e.k, .own = e.own, .w = e.w, .s = e.s, .g = m.g, .chains = chains, .rows = rows, .prompt = prompt, .taps = e.taps };
+     try R.embed(&p);
+     try splice(m.d, e.s, m.s.h, m.g.hidden, chains);
+@@ -160,7 +198,7 @@ fn put(m: *const Model, s: Stream, dst: u64, bytes: []const u8) !void {
+ }
+ 
+ /// Tokens and positions a row, each chain's first position, staged for the launches.
+-fn upload(m: *const Model, s: Stream, chains: []const Chain, rows: usize) !void {
++pub fn upload(m: *const Model, s: Stream, chains: []const Chain, rows: usize) !void {
+     const ids = try m.gpa.alloc(i32, 2 * rows + chains.len);
+     defer m.gpa.free(ids);
+     var at: usize = 0;
+diff --git a/zig/src/families/hrm_text/cuda_kernels.zig b/zig/src/families/hrm_text/cuda_kernels.zig
+index c365d18..e54afcb 100644
+--- a/zig/src/families/hrm_text/cuda_kernels.zig
++++ b/zig/src/families/hrm_text/cuda_kernels.zig
+@@ -1,12 +1,16 @@
+-//! HRM-Text's own CUDA launches beside the dense engine's (hrm_text.cu): scaled embedding rows, the states between
+-//! stack calls, gate|q|k|v with RoPE, and the attention output gate.
++//! HRM-Text's own CUDA launches beside the dense engine's (hrm_text.cu): scaled embedding rows, weightless RMS norms
++//! and fused stack-turn norms with PDL launch_dependents, vectorized SwiGLU, fused gate|q|k|v RoPE + paged KV write,
++//! strided prompt output gate, and MHA decode attention + fused output gate.
+ const std = @import("std");
+ const cuda = @import("cuda");
++const dense = @import("cuda_dense");
+ 
+ /// Threads a row kernel's block takes, one column each.
+ const row_threads = 256;
+ /// Threads a (row, head) RoPE block takes: dims j and j + 64 of a 128-dim head.
+ const rope_threads = 64;
++/// Threads an MHA (G = 1, HD = 128) decode attention block takes: one thread per head dim.
++const mha_threads = 128;
+ 
+ fn int(x: usize) c_int {
+     return @intCast(x);
+@@ -22,10 +26,14 @@ fn rowGrid(rows: usize, width: usize) !?cuda.launch.Dim3 {
+ pub const Kernels = struct {
+     mod: cuda.Module,
+     embed_fn: cuda.Function,
+-    start_fn: cuda.Function,
+-    turn_fn: cuda.Function,
+-    rope_fn: cuda.Function,
+-    gate_fn: cuda.Function,
++    add_rms_fn: cuda.Function,
++    start_rms_fn: cuda.Function,
++    turn_rms_fn: cuda.Function,
++    silu_mul_fn: cuda.Function,
++    rope_kv_fn: cuda.Function,
++    gate_strided_fn: cuda.Function,
++    mha_chunk_fn: cuda.Function,
++    mha_merge_gate_fn: cuda.Function,
+ 
+     pub fn load(ctx: *const cuda.Context) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -34,10 +42,14 @@ pub const Kernels = struct {
+         return .{
+             .mod = mod,
+             .embed_fn = try mod.function("tf_hrm_embed"),
+-            .start_fn = try mod.function("tf_hrm_start"),
+-            .turn_fn = try mod.function("tf_hrm_turn"),
+-            .rope_fn = try mod.function("tf_hrm_gqkv_rope"),
+-            .gate_fn = try mod.function("tf_hrm_gate"),
++            .add_rms_fn = try mod.function("tf_hrm_add_rms"),
++            .start_rms_fn = try mod.function("tf_hrm_start_rms"),
++            .turn_rms_fn = try mod.function("tf_hrm_turn_rms"),
++            .silu_mul_fn = try mod.function("tf_hrm_silu_mul"),
++            .rope_kv_fn = try mod.function("tf_hrm_gqkv_rope_kv"),
++            .gate_strided_fn = try mod.function("tf_hrm_gate_strided"),
++            .mha_chunk_fn = try mod.function("tf_hrm_attn_chunk_mha"),
++            .mha_merge_gate_fn = try mod.function("tf_hrm_attn_merge_gate"),
+         };
+     }
+ 
+@@ -55,41 +67,82 @@ pub const Kernels = struct {
+         try cuda.launch.launch(k.embed_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
+     }
+ 
+-    /// z_high = h; h = bf16(z_init + h): the first stack call's input.
+-    pub fn start(k: *const Kernels, s: cuda.Stream, h: u64, z_high: u64, z_init: u64, rows: usize, d: usize) !void {
+-        const grid = try rowGrid(rows, d) orelse return;
++    /// h = bf16(h + r) (when r != null), x = bf16(h * inv_rms), triggering PDL for the next matmul.
++    pub fn addRms(k: *const Kernels, s: cuda.Stream, h: u64, r: ?u64, x: u64, rows: usize, d: usize, eps: f32) !void {
++        if (rows == 0) return;
+         var a: cuda.Args = .{};
+-        for ([_]u64{ h, z_high, z_init }) |v| a.add(v);
++        for ([_]u64{ h, r orelse 0, x }) |v| a.add(v);
+         a.add(int(d));
+-        try cuda.launch.launch(k.start_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++        a.add(eps);
++        try cuda.launch.launch(k.add_rms_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = row_threads } }, s, &a);
+     }
+ 
+-    /// keep = x (a stack call's final norm); h = bf16(x + other): the next call's input.
+-    pub fn turn(k: *const Kernels, s: cuda.Stream, x: u64, keep: u64, other: u64, h: u64, rows: usize, d: usize) !void {
+-        const grid = try rowGrid(rows, d) orelse return;
++    /// z_high = h; h = bf16(z_init + h); x = bf16(h * inv_rms) in one kernel, triggering PDL.
++    pub fn startRms(k: *const Kernels, s: cuda.Stream, h: u64, z_high: u64, z_init: u64, x: u64, rows: usize, d: usize, eps: f32) !void {
++        if (rows == 0) return;
+         var a: cuda.Args = .{};
+-        for ([_]u64{ x, keep, other, h }) |v| a.add(v);
++        for ([_]u64{ h, z_high, z_init, x }) |v| a.add(v);
+         a.add(int(d));
+-        try cuda.launch.launch(k.turn_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++        a.add(eps);
++        try cuda.launch.launch(k.start_rms_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = row_threads } }, s, &a);
+     }
+ 
+-    /// From gqkv [rows, 4 heads x 128] bf16: gate heads to g, q rotated to q, k rotated and v to kv [rows, k | v].
+-    pub fn gqkvRope(k: *const Kernels, s: cuda.Stream, gqkv: u64, inv: u64, pos: u64, g: u64, q: u64, kv: u64, rows: usize, heads: usize) !void {
++    /// Fused stack boundary: h1 = bf16(h + r); keep = bf16(h1 * inv1); h = bf16(keep + other); x = bf16(h * inv2).
++    pub fn turnRms(k: *const Kernels, s: cuda.Stream, h: u64, r: u64, keep: u64, other: u64, x: u64, rows: usize, d: usize, eps: f32) !void {
+         if (rows == 0) return;
+-        if (rows > std.math.maxInt(c_int) or 4 * heads > 65535) return error.RowShape;
+         var a: cuda.Args = .{};
+-        for ([_]u64{ gqkv, inv, pos, g, q, kv }) |v| a.add(v);
++        for ([_]u64{ h, r, keep, other, x }) |v| a.add(v);
++        a.add(int(d));
++        a.add(eps);
++        try cuda.launch.launch(k.turn_rms_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = row_threads } }, s, &a);
++    }
++
++    /// Vectorized out [rows, f] = bf16(bf16(silu(gate)) * up) from gate|up [rows, 2*f], triggering PDL.
++    pub fn siluMul(k: *const Kernels, s: cuda.Stream, gu: u64, out: u64, rows: usize, f: usize) !void {
++        if (rows == 0 or f == 0) return;
++        const chunks = f / 8;
++        var a: cuda.Args = .{};
++        for ([_]u64{ gu, out }) |v| a.add(v);
++        a.add(int(f));
++        try cuda.launch.launch(k.silu_mul_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast((chunks + row_threads - 1) / row_threads) }, .block = .{ .x = row_threads } }, s, &a);
++    }
++
++    /// From gqkv [rows, 4 heads x 128] bf16: q rotated to q, k rotated and v written directly to paged KC/VC.
++    pub fn gqkvRopeKv(k: *const Kernels, s: cuda.Stream, sg: dense.kernels.AttnSegs, gqkv: u64, inv: u64, pos: u64, q: u64, row_off: usize, rows: usize, heads: usize) !void {
++        if (rows == 0) return;
++        if (rows > std.math.maxInt(c_int) or 3 * heads > 65535) return error.RowShape;
++        var a: cuda.Args = .{};
++        a.add(sg);
++        for ([_]u64{ gqkv, inv, pos, q }) |v| a.add(v);
++        a.add(int(row_off));
+         a.add(int(heads));
+-        try cuda.launch.launch(k.rope_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(4 * heads), .z = 1 }, .block = .{ .x = rope_threads } }, s, &a);
++        try cuda.launch.launch(k.rope_kv_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(3 * heads), .z = 1 }, .block = .{ .x = rope_threads } }, s, &a);
+     }
+ 
+-    /// y = bf16(bf16(sigmoid(g)) * y) in place, both [rows, d].
+-    pub fn gate(k: *const Kernels, s: cuda.Stream, g: u64, y: u64, rows: usize, d: usize) !void {
++    /// y = bf16(bf16(sigmoid(gqkv[row, 0..d])) * y) in place, gqkv [rows, 4*d], y [rows, d].
++    pub fn gateStrided(k: *const Kernels, s: cuda.Stream, gqkv: u64, y: u64, rows: usize, d: usize) !void {
+         const grid = try rowGrid(rows, d) orelse return;
+         var a: cuda.Args = .{};
+-        for ([_]u64{ g, y }) |v| a.add(v);
++        for ([_]u64{ gqkv, y }) |v| a.add(v);
+         a.add(int(d));
+-        try cuda.launch.launch(k.gate_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++        try cuda.launch.launch(k.gate_strided_fn, .{ .grid = grid, .block = .{ .x = row_threads } }, s, &a);
++    }
++
++    /// MHA (G = 1, HD = 128) decode attention over paged KV, fused with the sigmoid output gate from gqkv.
++    pub fn mhaAttendGate(k: *const Kernels, s: cuda.Stream, sg: dense.kernels.AttnSegs, q: u64, po: u64, pm: u64, pl: u64, gqkv: u64, out: u64, row_off: usize, rows: usize, heads: usize, nch: usize, z: usize) !void {
++        if (rows == 0) return;
++        const scale: f32 = 1.0 / @sqrt(@as(f32, 128.0));
++        var a: cuda.Args = .{};
++        a.add(sg);
++        for ([_]u64{ q, po, pm, pl }) |v| a.add(v);
++        for ([_]usize{ heads, dense.pages.page_rows, nch }) |v| a.add(int(v));
++        a.add(scale);
++        try cuda.launch.launch(k.mha_chunk_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads), .z = @intCast(z) }, .block = .{ .x = mha_threads } }, s, &a);
++        var b: cuda.Args = .{};
++        b.add(sg);
++        for ([_]u64{ po, pm, pl, gqkv, out }) |v| b.add(v);
++        for ([_]usize{ row_off, heads, dense.pages.page_rows, nch }) |v| b.add(int(v));
++        try cuda.launch.launch(k.mha_merge_gate_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads), .z = 1 }, .block = .{ .x = mha_threads } }, s, &b);
+     }
+ };
+ 
+diff --git a/zig/src/families/hrm_text/cuda_recipe.zig b/zig/src/families/hrm_text/cuda_recipe.zig
+index 7d6df05..f814e83 100644
+--- a/zig/src/families/hrm_text/cuda_recipe.zig
++++ b/zig/src/families/hrm_text/cuda_recipe.zig
+@@ -1,9 +1,9 @@
+ //! HRM-Text as a cuda_dense recipe: the engine's layer i is stack call i / per_stack's layer i % per_stack, with its
+ //! own cache slot i, so a token's 128 layer applications page like a 128-layer decoder's.
+ //!
+-//! Scratch use per layer (pass.zig's buffers): x.wide holds gate|q|k|v, then gate|up; x.acc's bytes hold the bf16
+-//! attention gate across the attention; x.y the attention out, then the SwiGLU rows. The recurrent states z_L and
+-//! z_H live in the weights' own row buffers.
++//! Scratch use per layer (pass.zig's buffers): x.wide holds gate|q|k|v (with gate read in-place across attention),
++//! then gate|up (skipped when NVFP4 prompts take fused SwiGLU); x.y holds the gated attention out, then the SwiGLU
++//! rows. The recurrent states z_L and z_H live in the weights' own row buffers.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const dense = @import("cuda_dense");
+@@ -79,29 +79,63 @@ pub fn layer(p: P, i: usize) !void {
+     const d = p.g.hidden;
+     if (j == 0) {
+         if (call == 0) {
+-            try p.own.start(p.s, x.h, p.w.z_high, p.w.z_init, p.rows, d);
++            try p.own.startRms(p.s, x.h, p.w.z_high, p.w.z_init, x.x, p.rows, d, p.g.eps);
+         } else {
+-            try p.norm(x.r, p.w.ones); // h + the last MLP's rows, then the stack's final norm into x
+             const high = c.isHigh(call - 1);
+-            try p.own.turn(p.s, x.x, if (high) p.w.z_high else p.w.z_low, if (high) p.w.z_low else p.w.z_high, x.h, p.rows, d);
++            try p.own.turnRms(p.s, x.h, x.r, if (high) p.w.z_high else p.w.z_low, if (high) p.w.z_low else p.w.z_high, x.x, p.rows, d, p.g.eps);
+         }
+-        try p.norm(null, p.w.ones);
+-    } else try p.norm(x.r, p.w.ones);
++    } else try p.own.addRms(p.s, x.h, x.r, x.x, p.rows, d, p.g.eps);
+     const l = p.w.layer(if (c.isHigh(call)) .high else .low, j);
+     try p.project(l.gqkv, x.x, x.wide);
+     try tapped(p, "gqkv", i, x.x, d, x.wide, p.g.acc);
+-    try p.own.gqkvRope(p.s, x.wide, p.m.inv, x.pos, x.acc, x.q, x.kv, p.rows, c.heads);
+-    try p.attend(i, x.q, x.kv, x.y);
+-    try p.own.gate(p.s, x.acc, x.y, p.rows, c.width());
++    try ropeAttendGate(p, i, c.heads);
+     try p.project(l.o, x.y, x.r);
+     try tapped(p, "o", i, x.y, c.width(), x.r, d);
+-    try p.norm(x.r, p.w.ones);
+-    try p.project(l.gate_up, x.x, x.wide);
+-    try p.siluMul(x.wide, x.y, p.g.mid);
++    try p.own.addRms(p.s, x.h, x.r, x.x, p.rows, d, p.g.eps);
++    if (!try p.projectSwiGlu(l.gate_up, x.x, x.y)) {
++        try p.project(l.gate_up, x.x, x.wide);
++        try p.own.siluMul(p.s, x.wide, x.y, p.rows, p.g.mid);
++    }
+     try p.project(l.down, x.y, x.r);
+     try tapped(p, "down", i, x.y, p.g.mid, x.r, d);
+ }
+ 
++/// Fused gate|q|k|v RoPE + paged KV write, attention over layer slot `i`, and sigmoid output gate (gate read in-place
++/// from x.wide): prompt takes PrefixLM attention + strided gate, decode takes MHA attention with fused gate epilogue.
++fn ropeAttendGate(p: P, layer_idx: usize, heads: usize) !void {
++    const m = p.m;
++    const x = m.s;
++    const kc = m.cache(layer_idx, false);
++    const vc = m.cache(layer_idx, true);
++    const qw = p.g.qWidth();
++    var row0: usize = 0;
++    var at: usize = 0;
++    while (at < p.chains.len) : (at += dense.kernels.max_segs) {
++        const group = p.chains[at..@min(p.chains.len, at + dense.kernels.max_segs)];
++        var sg = std.mem.zeroes(dense.kernels.AttnSegs);
++        var rows: usize = 0;
++        for (group, 0..) |ch, j| {
++            sg.kc[j] = kc;
++            sg.vc[j] = vc;
++            sg.meta[j] = x.meta + (at + j) * 4;
++            sg.pt[j] = m.tableOf(ch.slot);
++            sg.row0[j] = @intCast(rows);
++            rows += ch.tokens.len;
++        }
++        sg.ps = @intCast(m.pageElems());
++        sg.n = @intCast(group.len);
++        try p.own.gqkvRopeKv(p.s, sg, x.wide, m.inv, x.pos, x.q, row0, rows, heads);
++        if (!p.prompt) {
++            try p.own.mhaAttendGate(p.s, sg, x.q + row0 * qw * 2, x.po, x.pm, x.pl, x.wide, x.y, row0, rows, heads, m.chunks(), m.chunkBlocks());
++        }
++        row0 += rows;
++    }
++    if (p.prompt) {
++        try p.attendPromptOnly(layer_idx, x.q, x.y);
++        try p.own.gateStrided(p.s, x.wide, x.y, p.rows, qw);
++    }
++}
++
+ /// A projection's input [rows, k] and output [rows, n] as `<class>.<layer>.x` and `.y`, when a check taps the pass.
+ fn tapped(p: P, class: []const u8, i: usize, in: u64, k: usize, y: u64, n: usize) !void {
+     if (p.taps == null) return;
+@@ -112,7 +146,7 @@ fn tapped(p: P, class: []const u8, i: usize, in: u64, k: usize, y: u64, n: usize
+ 
+ /// The last H call ends: its last residual and its final norm, z_H, the head's input rows.
+ pub fn final(p: P) !void {
+-    try p.norm(p.m.s.r, p.w.ones);
++    try p.own.addRms(p.s, p.m.s.h, p.m.s.r, p.m.s.x, p.rows, p.g.hidden, p.g.eps);
+ }
+ 
+ pub fn head(w: *const Weights) cuda.qmmf.Weight {

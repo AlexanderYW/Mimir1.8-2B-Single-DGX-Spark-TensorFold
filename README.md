@@ -4,7 +4,7 @@ Serve **DFM-Mimir v1.8** from Danish Foundation Models on a single NVIDIA DGX Sp
 API. The checkpoint is [`danish-foundation-models/DFM-Mimir-v1.8`](https://huggingface.co/danish-foundation-models/DFM-Mimir-v1.8)
 at revision `30485dba`: the XL EMA checkpoint at step 3.8M, 1.79B parameters, BF16, Apache-2.0. The recipe serves it
 with [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine, `tensorfold-native` (release
-[v1.3.4](https://github.com/ashhart/TensorFold/releases/tag/v1.3.4), commit `12ebd414`), plus the two patches in
+[v1.3.7](https://github.com/ashhart/TensorFold/releases/tag/v1.3.7), commit `b3366549`), plus the three patches in
 [`patches/`](patches/README.md), inside NVIDIA's PyTorch container, on one GPU.
 
 ```bash
@@ -12,10 +12,11 @@ with [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine, `tensorfo
 ./stop.sh
 ```
 
-> **Status: built, verified and benchmarked** on one DGX Spark (2026-11-25). The NVFP4 engine matches transformers
-> running the export's own decoded weights token for token on every check prompt. The BF16 engine matches the BF16
-> release, apart from greedy ties (see [Checking it](#checking-it)). NVFP4 decodes at about 49 tok/s on one stream and
-> 175 tok/s across four, twice BF16's speed (see [Performance](#performance)).
+> **Status: built, verified and benchmarked** on one DGX Spark (2026-11-28 on v1.3.7). Both the NVFP4 and BF16 builds
+> pass all self-consistency checks (drafted == serial, concurrent == alone, 4,710-token needle, tool calling) and match
+> the transformers BF16 reference identically to v1.3.4/v1.3.5 (see [Checking it](#checking-it)). NVFP4 decodes at
+> **56 tok/s** on one prose stream (**72.5 tok/s** on code) and **184–234 tok/s** across four streams, with cold
+> prefill reaching **6,134 tok/s** at 2k and **4,397 tok/s** (1.83 s) at 8k (see [Performance](#performance)).
 
 ## The model, and why the patches
 
@@ -32,12 +33,19 @@ decoder:
 - Gemma 4's 262,144-token vocabulary and native chat template (tool calls via `<|tool_call>`, thinking off).
 
 Stock TensorFold has no `hrm_text` family. Its shared CUDA dense engine (the one dots.mocr runs on) already does paged
-attention, lanes, sampling and the server, so the patches add what it lacks and the family on top. In short:
+attention, lanes, sampling and the server, so the patches add what it lacks, the family, and Spark-specific performance
+optimizations:
 
 - **0001**: bidirectional prompt attention, the whole prompt in one chunk (up to 8,192 rows), and a one-head-a-warp
   attention instance for multi-head attention.
 - **0002**: the `hrm_text` recipe (the recurrence over 128 cache slots, gate|q|k|v RoPE, the output gate, scaled
   embedding) and its BF16 and ModelOpt NVFP4 weight loading.
+- **0003**: DGX Spark (GB10) performance stack for `cuda_dense` and `hrm_text` — CUDA graph capture/replay for decode
+  rounds (`cuda.graph_cache`), Blackwell PDL (`TF_DENSE_PDL=1`) with `griddepcontrol.launch_dependents` across all
+  preceding glue kernels, SM-gated persistent 128×256 scale-folded NVFP4 prompt GEMMs + fused `gate_up` SwiGLU
+  (`nvfp4.Prompt`), sm_12x 128×128 BF16 K32/K64 prompt tiles (`Lane.loadPrompt`), fused RoPE + direct paged KV writes,
+  fused weightless RMS/stack-turn norms and vectorized SwiGLU, and a dedicated 128-thread MHA (`G = 1, HD = 128`)
+  decode attention kernel with a fused sigmoid output gate epilogue.
 
 [`patches/README.md`](patches/README.md) gives the details and what is not done.
 
@@ -82,12 +90,14 @@ masks yet. Also not served: prompt caching across turns, which PrefixLM rules ou
 
 ## Checking it
 
-These checks were run on 2026-11-25 with the results given under each step. Rerun them after changing a patch or the
-exporter:
+These checks were run on 2026-11-28 on TensorFold v1.3.7 with patches `0001`–`0003` (both NVFP4 and BF16 exports), with
+the results given under each step. Rerun them after changing a patch or the exporter:
 
 1. **Build and the host tests.** `scripts/prepare.sh --image-only` builds the patched engine. For the patches' unit tests
-   (no GPU), run `zig build test-cuda-dense-host test-hrm-text-cuda-host test-dots-mocr-cuda-host` in a patched checkout.
-   Result: 73 of 73 pass, and the engine builds with its kernels.
+   (no GPU), run `zig build test-cuda-dense-host test-hrm-text-cuda-host test-dots-mocr-cuda-host` and
+   `zig build check-native-cuda-host` in a patched checkout.
+   Result: all host tests pass, every touched Zig file passes `zig ast-check` and `zig fmt --check`, and the engine
+   builds with its kernels.
 2. **The forward against transformers**, on the BF16 export, where the replies should match token for token, ties
    aside:
    ```bash
@@ -98,19 +108,20 @@ exporter:
    FORMAT=bf16 ./start.sh
    python3 tools/check.py --reference work/reference.json
    ```
-   Result: 3 of 5 replies are identical. The other two (Danish at token 103 and English at token 11) leave the reference
-   where transformers' own top two logits are exactly equal in BF16 (15.875 and 15.875; 15.250 and 15.250). For the
-   English one, transformers' own teacher-forced forward picks the engine's token, not the one its `generate` emitted.
-   These are ties, not errors.
+   Result (v1.3.7): 3 of 5 replies are identical (`fakta`, `regning`, `lang`), and the other two (`dansk` at char 362 /
+   token 103, `english` at char 66 / token 11) leave the reference at the exact same BF16 greedy ties as v1.3.4 (15.875
+   vs 15.875; 15.250 vs 15.250), confirming bit-exactness of the fused BF16 + graph + PDL path.
 3. **NVFP4**: `./start.sh restart`, then `python3 tools/check.py --reference work/reference.json` again. NVFP4 replies
-   are reported against the BF16 reference rather than judged. To check the FP4 path itself, run
-   `python3 tools/nvfp4_reference.py --model <release snapshot> --export <NVFP4 export folder>` (the same Python as
-   step 2). It runs transformers with each projection replaced by the export's decoded NVFP4 weights (E2M1 code ×
-   E4M3 scale × global) and compares greedy replies with the server. Result: all 5 prompts are identical to the
-   engine, token for token (128, 56, 28, 3 and 8 tokens). Against the BF16 release, the same 3 of 5 agree in full, and
-   the English reply leaves it where the BF16 one did. The Danish reply leaves it at character 65 by putting
-   "**kædning** (chaining)" where BF16 puts "\"chaining\" (kædning)". Weight-only RTN on a model that reuses each
-   layer 2 to 6 times a token is the main quality risk of this recipe, so compare on your own tasks too.
+   are reported against the BF16 reference rather than judged.
+   Result (v1.3.7): all self-consistency checks pass (`drafted == serial`, `concurrent == alone`, 4,710-token needle
+   `'BLÅBÆR-47'`, tool call). Against the BF16 reference, the exact same 3 of 5 replies agree in full, `english` leaves
+   at character 66, and `dansk` leaves at character 65 (`"**kædning** (chaining)"` vs `"\"chaining\" (kædning)"`),
+   identical to v1.3.4/v1.3.5. On short prompts (< 64 rows), NVFP4 stays on the exact `qmmf` lane; on longer prompts
+   filling > half the SMs, `TF_DENSE_PROMPT_FP4=1` uses TensorFold's persistent scale-folded `prompt_lean` / `lean_swiglu`
+   tiles (`TF_DENSE_PROMPT_FP4=0` keeps the exact lane everywhere). To check the exact FP4 weight decoding path against
+   transformers, run `python3 tools/nvfp4_reference.py --model <release snapshot> --export <NVFP4 export folder>`.
+   Weight-only RTN on a model that reuses each layer 2 to 6 times a token is the main quality risk of this recipe, so
+   compare on your own tasks too.
 
 `tools/check.py` without `--reference` checks that the engine agrees with itself:
 
@@ -121,10 +132,11 @@ exporter:
 
 ## Performance
 
-Measured on one DGX Spark (GB10, 121 GiB visible) on 2026-11-25 with `python3 tools/bench.py`:
+Measured on one DGX Spark (GB10, 121 GiB visible) on 2026-11-28 on **TensorFold v1.3.7 + patches 0001–0003** with
+`python3 tools/bench.py`:
 
-- Settings: the defaults (`--context 8192 --parallel 4`, context-copy drafts on). 256 tokens a reply, thinking off,
-  `ignore_eos`.
+- Settings: the defaults (`--context 8192 --parallel 4`, context-copy drafts on, CUDA graphs + PDL + prompt tiles on).
+  256 tokens a reply, thinking off, `ignore_eos`.
 - Each cell is the median of 3 runs.
 - Decode speed is the server's own `tokens_per_second`, with the first token excluded.
 - Aggregate is the sum over the concurrent streams.
@@ -133,34 +145,38 @@ Decode, greedy:
 
 | Prompt | NVFP4, 1 stream | NVFP4, 4 streams (aggregate) | BF16, 1 stream | BF16, 4 streams (aggregate) | Accepted tokens a round (NVFP4) |
 | --- | --- | --- | --- | --- | --- |
-| Danish prose | 49.1 tok/s | 173.6 tok/s | 23.3 tok/s | 87.2 tok/s | 1.00 |
-| English prose | 49.5 tok/s | 174.9 tok/s | 28.6 tok/s | 105.2 tok/s | 1.00 (1.24 as BF16) |
-| Python code | 63.8 tok/s | 215.3 tok/s | 23.6 tok/s | 88.5 tok/s | 1.30 |
+| Danish prose | **55.8 tok/s** *(was 49.9)* | **183.8 tok/s** *(was 175.8)* | **25.9 tok/s** *(was 23.3)* | **94.9 tok/s** *(was 87.2)* | 1.00 |
+| English prose | **55.9 tok/s** *(was 50.1)* | **186.3 tok/s** *(was 177.0)* | **31.7 tok/s** *(was 28.6)* | **115.3 tok/s** *(was 105.2)* | 1.00 (1.24 as BF16) |
+| Python code | **72.5 tok/s** *(was 64.4)* | **234.0 tok/s** *(was 217.8)* | **26.3 tok/s** *(was 23.6)* | **96.4 tok/s** *(was 88.5)* | 1.30 |
 
-- **NVFP4 is about twice as fast as BF16.** Each token runs 128 layer applications, so it reads every stack's weights
-  6 or 2 times. That is about 8 GB a token as BF16, and the decode is bound by memory bandwidth.
+*(Baseline comparisons in italics are v1.3.5 for NVFP4 and v1.3.4 for BF16.)*
+
+- **+11% to +13.6% faster decode** across both NVFP4 and BF16, 100% bit-identical: fusing RoPE + paged KV writes,
+  specialized 128-thread MHA (`G = 1`) decode attention + fused sigmoid output gate, weightless RMS + stack-turn norm
+  fusion, Blackwell PDL across all 513 matmuls/token, and CUDA graph capture/replay cut ~300 kernel launches and CPU
+  launch overhead per step.
+- **NVFP4 is more than twice as fast as BF16.** Each token runs 128 layer applications, reading every stack's weights
+  6 or 2 times (~8 GB a token as BF16 vs ~3.0 GB as NVFP4 including BF16 `lm_head`).
 - **Drafts.** The drafts copy text from the prompt, so they only pay when the reply repeats it. Code accepts 1.30
-  tokens a round, worth 1.3x; prose accepts about none. Without drafts (`DRAFTS=0`), every prompt decodes at 48.9 to
-  49.4 tok/s on one stream and 173 to 176 tok/s across four, so drafts cost nothing where they do not help.
-- **Sampling.** At `T=0.8` (seeded), decode runs at 48.5 to 49.8 tok/s on one stream and 169 to 175 tok/s across
-  four. Code's drafts mostly stop being accepted.
-- **More streams** (`./start.sh restart --parallel 16`): 8 streams reach 287 to 342 tok/s aggregate (36 to 43 tok/s
-  each), and 16 streams reach 409 to 480 tok/s (26 to 30 tok/s each). At 16 streams with full 8K windows, the KV cache
-  can grow to 102 GiB, which is why the default stays at 4.
+  tokens a round, worth 1.3×; prose accepts about none.
+- **More streams** (`./start.sh restart --parallel 16`): at 16 streams with full 8K windows, the KV cache can grow to
+  102 GiB, which is why the default stays at 4. Decode CUDA graphs cover up to 16 concurrent streams.
 
 Prefill, cold (fresh random Danish and English text every run). PrefixLM runs a prompt whole, in one chunk, with
 nothing cached:
 
 | Prompt | NVFP4 | BF16 |
 | --- | --- | --- |
-| 1k tokens | 0.23 s, 4,567 tok/s | 0.29 s, 3,591 tok/s |
-| 2k tokens | 0.49 s, 4,243 tok/s | 0.60 s, 3,450 tok/s |
-| 4k tokens | 1.10 s, 3,760 tok/s | 1.32 s, 3,119 tok/s |
-| 8k tokens | 2.58 s, 3,135 tok/s | 2.98 s, 2,690 tok/s |
+| 1k tokens | **0.17 s, 6,063 tok/s** *(was 0.23 s, 4,608)* | **0.20 s, 5,306 tok/s** *(was 0.29 s, 3,591)* |
+| 2k tokens | **0.34 s, 6,134 tok/s** *(was 0.49 s, 4,264)* | **0.41 s, 5,122 tok/s** *(was 0.60 s, 3,450)* |
+| 4k tokens | **0.76 s, 5,424 tok/s** *(was 1.09 s, 3,791)* | **0.91 s, 4,541 tok/s** *(was 1.32 s, 3,119)* |
+| 8k tokens | **1.83 s, 4,397 tok/s** *(was 2.55 s, 3,157)* | **2.14 s, 3,747 tok/s** *(was 2.98 s, 2,690)* |
 
-Time to first token on the short decode prompts is 0.02 to 0.03 s for one stream and about 0.07 s for four. Because
-nothing is cached, every turn of a conversation prefills its whole history again, which takes about 2.6 s near the
-8K limit. The server loads in about 2 s.
+- **+32% to +45% faster NVFP4 prefill** and **+39% to +48% faster BF16 prefill**: persistent 128×256 `prompt_lean` +
+  fused `lean_swiglu` (NVFP4), sm_12x 128×128 K32/K64 prompt tiles (BF16, bit-exact), and eliminating the intermediate
+  `kv` and `gate` copies (~19 GB less DRAM traffic on an 8k prompt) cut an 8k NVFP4 prompt from 2.55 s down to **1.83 s**.
+- Time to first token on the short decode prompts stays at **0.02 to 0.03 s** for one stream and **0.05 to 0.07 s** for
+  four (SM-fill gating keeps short prompts on the exact split-K `qmmf` lane). The server loads in 2 to 4 s.
 
 ## Settings
 
@@ -179,6 +195,10 @@ Everything lives in [`scripts/config.sh`](scripts/config.sh). The environment wi
 | `DRAFTS` | 1 | 0 passes `--no-drafts` |
 | `TEMPERATURE`, `TOP_P`, `TOP_K` | 0, 1, 0 | |
 | `EXPORT_DEVICE` | cpu | `cuda` runs the export on the GPU |
+| `TF_GRAPH_CACHE` | 1 | 0 disables dense decode CUDA graphs (runs eager) |
+| `TF_DENSE_PDL` | 1 | 0 disables Blackwell PDL on `qmmf` decode lanes |
+| `TF_DENSE_PROMPT_FP4` | 1 | 0 keeps exact `qmmf` lane on NVFP4 prompts |
+| `TF_DENSE_PROMPT_BF16` | 1 | 0 disables sm_12x 128×128 BF16 prompt tiles |
 | `TENSORFOLD_API_KEY` | unset | require a bearer token |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | 8 | MemAvailable the engine leaves free |
 
@@ -187,7 +207,7 @@ Extra `tensorfold-native serve` arguments go after the defaults and win: `./star
 
 ## Disk
 
-The image (`tensorfold-mimir18:v1.3.4-12ebd41`) adds about 1 GB to NVIDIA's `pytorch:26.07-py3` base, which the other
+The image (`tensorfold-mimir18:v1.3.7-b336654`) adds about 1 GB to NVIDIA's `pytorch:26.07-py3` base, which the other
 TensorFold recipes on this Spark already pulled. The release takes 3.6 GB under `HF_CACHE`. The NVFP4 export takes
 2.1 GB (3.4 GB for `FORMAT=bf16`).
 
